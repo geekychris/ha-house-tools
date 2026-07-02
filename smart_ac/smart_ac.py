@@ -54,19 +54,31 @@ import urllib.request
 
 
 # Persistent decision log: one JSON object per tick, append-only with rotation.
-# Use `tail -F /home/chris/smart_ac/decisions.log` to follow live; the
-# .jsonl-style format means you can `jq` over it.
-DECISIONS_LOG = pathlib.Path("/home/chris/smart_ac/decisions.log")
+# Override with SMART_AC_DECISIONS_LOG env var. Follow with
+# `tail -F $SMART_AC_DECISIONS_LOG` (jsonl-style, jq-friendly).
+DECISIONS_LOG = pathlib.Path(os.environ.get(
+    "SMART_AC_DECISIONS_LOG",
+    str(pathlib.Path.home() / "smart_ac" / "decisions.log"),
+))
 _decisions_logger = logging.getLogger("smart_ac.decisions")
 _decisions_logger.propagate = False
 if not _decisions_logger.handlers:
-    DECISIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
-    _h = logging.handlers.RotatingFileHandler(
-        str(DECISIONS_LOG), maxBytes=10 * 1024 * 1024, backupCount=5
-    )
-    _h.setFormatter(logging.Formatter("%(message)s"))
-    _decisions_logger.addHandler(_h)
-    _decisions_logger.setLevel(logging.INFO)
+    try:
+        DECISIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _h = logging.handlers.RotatingFileHandler(
+            str(DECISIONS_LOG), maxBytes=10 * 1024 * 1024, backupCount=5
+        )
+        _h.setFormatter(logging.Formatter("%(message)s"))
+        _decisions_logger.addHandler(_h)
+        _decisions_logger.setLevel(logging.INFO)
+    except OSError:
+        # Read-only filesystem or non-writable path (e.g. under pytest
+        # from CI). Downgrade to a stderr handler so the module still
+        # imports cleanly.
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(message)s"))
+        _decisions_logger.addHandler(_h)
+        _decisions_logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------- helpers
@@ -208,7 +220,11 @@ class Snapshot:
 class SchedulerState:
     """Persists across ticks. Tracks what WE commanded vs manual user toggles."""
 
-    PATH = pathlib.Path("/home/chris/smart_ac_state.json")
+    # Override with SMART_AC_STATE_PATH env var; systemd unit ships a sensible default.
+    PATH = pathlib.Path(os.environ.get(
+        "SMART_AC_STATE_PATH",
+        str(pathlib.Path.home() / "smart_ac_state.json"),
+    ))
 
     def __init__(self):
         self.last_action_at: dict[str, str] = {}  # ISO datetime
