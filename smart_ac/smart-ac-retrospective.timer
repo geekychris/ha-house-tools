@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly smart_ac retrospective analysis
+
+[Timer]
+# Fires at 00:30 local every day. Covers the previous 24h.
+OnCalendar=*-*-* 00:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

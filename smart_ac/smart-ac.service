@@ -1,0 +1,16 @@
+[Unit]
+Description=Smart AC scheduler (decides which ACs run based on solar / battery / temp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chris
+WorkingDirectory=/home/chris/smart_ac
+ExecStart=/usr/bin/python3 /home/chris/smart_ac/smart_ac.py
+EnvironmentFile=/home/chris/smart_ac/smart_ac.env
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

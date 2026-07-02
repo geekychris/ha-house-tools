@@ -1,0 +1,18 @@
+# Secrets — never commit
+token.txt
+bot_token.txt
+*.env
+secrets.yaml
+credentials.json
+
+# Local config (users' own hardware inventory)
+config.json
+smart_ac/smart_ac.json
+smart_ac/smart_ac.env
+smart_ac/decisions.log
+smart_ac/state.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/

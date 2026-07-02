@@ -1,0 +1,15 @@
+[Unit]
+Description=Pi Speaker TTS HTTP server (called by Home Assistant)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chris
+WorkingDirectory=/home/chris
+ExecStart=/usr/bin/python3 /home/chris/tts_speaker.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Smart AC retrospective analysis (writes markdown report + sensor.smart_ac_retrospective)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=chris
+WorkingDirectory=/home/chris/smart_ac
+ExecStart=/usr/bin/python3 /home/chris/smart_ac/retrospective.py
+EnvironmentFile=/home/chris/smart_ac/smart_ac.env

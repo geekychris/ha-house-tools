@@ -1,0 +1,64 @@
+{
+  "_comment": "smart_ac scheduler config -- copy to smart_ac.json, edit for your house, then sudo systemctl restart smart-ac",
+
+  "sun_offset_morning_min": 90,
+  "sun_offset_evening_min": 120,
+  "soc_target_at_dark": 100,
+
+  "_rooms_comment": "Room slugs match the input_boolean.ac_<slug> entities you create with setup_ac_input_booleans.py. Below are examples for a 6-AC house; substitute your own.",
+  "night_min_acs": ["master", "kids", "guest"],
+  "day_priority":  ["living", "dining", "office"],
+
+  "_evening_comment": "EVENING period = between effective_day_end (sun-based) and bedtime_hour. Family still up but solar gone. Target = evening_min_acs + evening_extra_required.",
+  "bedtime_hour": 22,
+  "evening_min_acs": ["master"],
+  "evening_extra_required": ["living"],
+  "unoccupied_evening_min_acs": [],
+  "unoccupied_evening_extra_required": [],
+
+  "ac_power_estimate_w": 1000,
+
+  "comfort_target_f": 78,
+  "unsensored_assume_hot_above_outdoor_f": 80,
+
+  "min_on_minutes": 15,
+  "min_off_minutes": 10,
+  "manual_override_minutes": 30,
+
+  "evaluation_interval_minutes": 5,
+
+  "enabled_entity": "input_boolean.smart_ac_enabled",
+  "notify_entity_toggle": "input_boolean.smart_ac_notify_telegram",
+  "notify_target": "notify.telegram",
+
+  "unoccupied_entity": "input_boolean.house_unoccupied",
+  "_unoccupied_comment": "Vacation / no-one-home mode: relaxed targets, fewer ACs at once, daily rotation across priority to spread wear.",
+  "unoccupied_night_min_acs": [],
+  "unoccupied_max_acs_total": 2,
+  "unoccupied_comfort_target_f": 82,
+  "unoccupied_unsensored_assume_hot_above_outdoor_f": 90,
+
+  "_sensor_map_comment": "Per-room temperature sensor entity IDs (or omit a room to use outdoor + heuristic).",
+  "indoor_sensor_for_room": {
+    "living": "sensor.temp_humidity_temperature",
+    "master": "sensor.temp_humidity_temperature_3"
+  },
+
+  "outdoor_sensor": "sensor.temp_humidity_temperature_2",
+
+  "_inverter_comment": "Solar / battery sensor entity IDs. These names come from whatever integration exposes your inverter; substitute yours.",
+  "soc_sensor":          "sensor.inverter_state_of_charge",
+  "battery_power_sensor": "sensor.inverter_battery_power",
+  "pv_power_sensor":      "sensor.inverter_pv_total_power",
+  "load_sensor":          "sensor.inverter_total_load_power",
+
+  "_battery_capacity_comment": "Bank capacity used for time-to-empty math. Example: 840Ah at 51.2V nominal LFP = ~43 kWh.",
+  "battery_ah": 840,
+  "battery_nominal_v": 51.2,
+
+  "status_sensor_entity": "sensor.smart_ac_status",
+
+  "ha_url": "http://ha.example.local:8123",
+
+  "log_level": "INFO"
+}

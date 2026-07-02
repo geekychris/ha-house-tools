@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""
+smart_ac web UI -- HTTP dashboard on pi-sf.
+
+Serves at http://pi.example.local:5010/
+
+Pages:
+  /              -- Dashboard: current scheduler status + quick links
+  /reports       -- List all daily retrospective reports
+  /reports/<d>   -- Render one specific report as pre-formatted text
+  /decisions     -- Live tail of the last N decision-log JSON records
+  /calibrate     -- Show last calibration result + button to launch a new run
+  /status.json   -- JSON API for anyone else who wants to consume
+
+POST endpoints:
+  /calibrate     -- Spawns calibrate.py in background; redirects back to /calibrate
+
+Read-only for everything else; assumes LAN access is trust boundary
+(same posture as HA's own dashboard).
+
+Runs as systemd service smart-ac-web on pi-sf.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import html
+import http.server
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+
+HERE = pathlib.Path(__file__).resolve().parent
+DECISIONS_LOG = pathlib.Path("/home/chris/smart_ac/decisions.log")
+REPORTS_DIR = pathlib.Path("/home/chris/smart_ac/reports")
+CALIBRATE_STDOUT = pathlib.Path("/home/chris/smart_ac/calibrate.log")
+SCHEDULER_STATE = pathlib.Path("/home/chris/smart_ac_state.json")
+
+PORT = 5010
+
+# ---------------------------------------------------------------------- config
+
+
+def load_config() -> dict:
+    p = pathlib.Path(os.environ.get("SMART_AC_CONFIG", HERE / "smart_ac.json"))
+    return json.loads(p.read_text())
+
+
+CFG = load_config()
+
+
+def ha_get(path: str) -> object | None:
+    try:
+        req = urllib.request.Request(
+            f"{CFG['ha_url'].rstrip('/')}{path}",
+            headers={"Authorization": f"Bearer {os.environ.get('HA_TOKEN', '')}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"# ha_get {path}: {e}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------------- HTML
+
+STYLE = """
+<style>
+  :root {
+    --bg: #0f1116;
+    --card: #171a22;
+    --line: #23283a;
+    --text: #dde3ec;
+    --dim: #8592a8;
+    --accent: #56a0ff;
+    --accent-2: #7ce38b;
+    --warn: #ffb454;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "SF Pro Text", "Segoe UI", monospace;
+  }
+  header {
+    background: var(--card); padding: 12px 20px;
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 20px;
+  }
+  header a {
+    color: var(--accent); text-decoration: none;
+    padding: 5px 10px; border-radius: 4px;
+  }
+  header a:hover { background: var(--line); }
+  header .title { font-size: 18px; font-weight: bold; color: var(--text); }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    padding: 15px 20px; margin-bottom: 15px; border-radius: 6px;
+  }
+  h1, h2, h3 { color: var(--accent); margin-top: 0; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 18px; }
+  h3 { font-size: 16px; }
+  .mode {
+    display: inline-block; padding: 4px 12px;
+    border-radius: 4px; font-weight: bold;
+    background: var(--line);
+  }
+  .mode-SURPLUS { background: var(--accent-2); color: #000; }
+  .mode-ON_TRACK { background: var(--accent); color: #000; }
+  .mode-EVENING { background: var(--warn); color: #000; }
+  .mode-NIGHT { background: #445; }
+  .mode-DEFICIT, .mode-CHARGE_BEHIND { background: var(--err); color: #fff; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: normal; text-transform: uppercase; font-size: 11px; }
+  pre {
+    background: #000; padding: 12px; overflow-x: auto;
+    font-size: 12px; border-radius: 4px; border: 1px solid var(--line);
+  }
+  .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 20px; }
+  .kv div:nth-child(odd) { color: var(--dim); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+  @media (max-width: 700px) { .grid2 { grid-template-columns: 1fr; } }
+  button, .btn {
+    background: var(--accent); color: #000; border: 0;
+    padding: 8px 16px; border-radius: 4px; font-weight: bold;
+    cursor: pointer; font-family: inherit; font-size: 14px;
+    text-decoration: none; display: inline-block;
+  }
+  button:hover, .btn:hover { opacity: 0.85; }
+  .subtle { color: var(--dim); font-size: 12px; }
+  .status-good { color: var(--accent-2); }
+  .status-warn { color: var(--warn); }
+  .status-err { color: var(--err); }
+  a { color: var(--accent); }
+</style>
+"""
+
+
+def page(title: str, body: str, refresh_sec: int | None = None) -> bytes:
+    refresh = f'<meta http-equiv="refresh" content="{refresh_sec}">' if refresh_sec else ""
+    html = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} — smart_ac</title>
+{refresh}
+{STYLE}
+</head>
+<body>
+<header>
+  <span class="title">smart_ac</span>
+  <a href="/">Dashboard</a>
+  <a href="/reports">Reports</a>
+  <a href="/decisions">Decisions</a>
+  <a href="/overrides">Overrides</a>
+  <a href="/calibrate">Calibrate</a>
+  <a href="/status.json">JSON</a>
+</header>
+<main>
+{body}
+</main>
+</body></html>"""
+    return html.encode("utf-8")
+
+
+# ---------------------------------------------------------------------- views
+
+
+def view_dashboard() -> bytes:
+    s = ha_get(f"/api/states/{CFG['status_sensor_entity']}")
+    if not s:
+        return page("Dashboard", '<div class="card">No status available. Is smart-ac running?</div>')
+    a = s.get("attributes", {})
+    mode = a.get("mode", "?")
+    target_on = a.get("target_on") or []
+    target_off = a.get("target_off") or []
+    indoor = a.get("indoor_f") or {}
+    reasons = a.get("reasons") or {}
+    actions = a.get("actions_this_tick") or []
+    last_iso = a.get("last_decision_at", "?")
+    try:
+        last = dt.datetime.fromisoformat(last_iso).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        last = last_iso
+
+    rows_reason = "".join(
+        f"<tr><td>{r}</td><td>{reasons[r]}</td></tr>"
+        for r in sorted(reasons.keys())
+    )
+    indoor_txt = " · ".join(f"{k} {v}°F" for k, v in indoor.items())
+    actions_txt = "<br>".join(actions) if actions else "(none)"
+
+    body = f"""
+<div class="card">
+  <h1>Now: <span class="mode mode-{mode}">{mode}</span></h1>
+  <div class="grid2">
+    <div class="kv">
+      <div>SoC</div><div>{a.get('soc')}%</div>
+      <div>Battery</div><div>{a.get('battery_power_w')} W</div>
+      <div>Solar</div><div>{a.get('pv_power_w')} W</div>
+      <div>Load</div><div>{a.get('load_w')} W</div>
+      <div>Outdoor</div><div>{a.get('outdoor_f')}°F</div>
+      <div>Indoor</div><div>{indoor_txt}</div>
+    </div>
+    <div class="kv">
+      <div>Target ON</div><div class="status-good">{', '.join(target_on) or '(none)'}</div>
+      <div>Target OFF</div><div class="status-warn">{', '.join(target_off) or '(none)'}</div>
+      <div>Enabled</div><div>{a.get('enabled')}</div>
+      <div>Notify TG</div><div>{a.get('notify_telegram')}</div>
+      <div>Unoccupied</div><div>{a.get('unoccupied')}</div>
+      <div>Last eval</div><div class="subtle">{last}</div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Per-room reasoning</h2>
+  <table><tr><th>Room</th><th>Reason</th></tr>{rows_reason}</table>
+</div>
+
+<div class="card">
+  <h2>Actions this tick</h2>
+  <div>{actions_txt}</div>
+</div>
+"""
+    return page("Dashboard", body, refresh_sec=60)
+
+
+def view_reports_list() -> bytes:
+    files = sorted(REPORTS_DIR.glob("*.md"), reverse=True) if REPORTS_DIR.exists() else []
+    if not files:
+        rows = "<tr><td>(no reports yet — run <code>python3 retrospective.py</code>)</td></tr>"
+    else:
+        rows = "".join(
+            f'<tr><td><a href="/reports/{f.stem}">{f.stem}</a></td>'
+            f'<td class="subtle">{f.stat().st_size} bytes</td></tr>'
+            for f in files
+        )
+    body = f"""
+<div class="card">
+  <h1>Daily reports</h1>
+  <p class="subtle">Nightly retrospective analysis, one per day. Each report includes SoC trajectory, mode timing, per-AC runtime, and per-AC estimated draw.</p>
+  <table><tr><th>Date</th><th></th></tr>{rows}</table>
+</div>
+"""
+    return page("Reports", body)
+
+
+def _md_inline(s: str) -> str:
+    """Inline markdown: **bold**, `code`. HTML-escape everything else."""
+    s = html.escape(s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    return s
+
+
+def render_markdown(md: str) -> str:
+    """Minimal markdown->HTML renderer covering the constructs our reports
+    use: # / ## / ### headers, - bullet lists, **bold**, `code`, and
+    | pipe | tables |. No nested lists, no raw HTML pass-through.
+    Everything else becomes a paragraph."""
+    lines = md.splitlines()
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.rstrip()
+
+        if not stripped:
+            i += 1
+            continue
+
+        # Headers
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            level = len(m.group(1))
+            out.append(f"<h{level}>{_md_inline(m.group(2))}</h{level}>")
+            i += 1
+            continue
+
+        # Table: line starts with |, plus a separator line beneath
+        if stripped.startswith("|") and i + 1 < n and re.match(r"^\|[-:| ]+\|$", lines[i + 1].strip()):
+            header_cells = [c.strip() for c in stripped.strip("|").split("|")]
+            i += 2  # skip header + separator
+            rows_html = []
+            while i < n and lines[i].strip().startswith("|"):
+                row = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                rows_html.append(
+                    "<tr>" + "".join(f"<td>{_md_inline(c)}</td>" for c in row) + "</tr>"
+                )
+                i += 1
+            head_html = "<tr>" + "".join(
+                f"<th>{_md_inline(c)}</th>" for c in header_cells
+            ) + "</tr>"
+            out.append(f"<table>{head_html}{''.join(rows_html)}</table>")
+            continue
+
+        # Bullet list
+        if stripped.startswith("- "):
+            items = []
+            while i < n and lines[i].lstrip().startswith("- "):
+                items.append(f"<li>{_md_inline(lines[i].lstrip()[2:])}</li>")
+                i += 1
+            out.append("<ul>" + "".join(items) + "</ul>")
+            continue
+
+        # Paragraph: collect until blank line or a special-block start
+        para_lines = [stripped]
+        i += 1
+        while i < n:
+            nxt = lines[i].rstrip()
+            if not nxt:
+                break
+            if re.match(r"^(#{1,6}\s|\||-\s)", nxt.lstrip()):
+                break
+            para_lines.append(nxt)
+            i += 1
+        out.append("<p>" + _md_inline(" ".join(para_lines)) + "</p>")
+
+    return "\n".join(out)
+
+
+def view_report(name: str) -> bytes:
+    # Basic sanitisation: only allow YYYY-MM-DD.md-ish names.
+    if not all(c.isalnum() or c in "-_" for c in name):
+        return page("Report", '<div class="card">Invalid report name.</div>')
+    p = REPORTS_DIR / f"{name}.md"
+    if not p.is_file():
+        return page("Report", f'<div class="card">Report {name} not found.</div>')
+    rendered = render_markdown(p.read_text())
+    body = f"""
+<div class="card">
+  <div class="subtle" style="margin-bottom:12px">
+    <a href="/reports">← Back to reports</a> ·
+    Source: <code>{p}</code>
+  </div>
+  {rendered}
+</div>
+"""
+    return page(f"Report {name}", body)
+
+
+def _fmt_local_time(iso: str) -> str:
+    """ISO UTC timestamp -> local 'HH:MM:SS' string."""
+    try:
+        return dt.datetime.fromisoformat(iso).astimezone().strftime("%H:%M:%S")
+    except Exception:
+        return iso[11:19] if len(iso) > 19 else iso
+
+
+def view_decisions() -> bytes:
+    n = 30
+    rows = ""
+    if DECISIONS_LOG.exists():
+        lines = DECISIONS_LOG.read_text().strip().splitlines()[-n:]
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            ts_local = _fmt_local_time(rec.get("ts", ""))
+            mode = rec.get("mode", "?")
+            targets = ", ".join(rec.get("target_on", []))
+            acts = rec.get("actions") or []
+            reasons = rec.get("reasons") or {}
+            # Add the reason next to each action so the decisions view answers
+            # "why" for each turn_on/turn_off in one glance.
+            act_lines = []
+            for a in acts:
+                # a is "room:turn_on" or "room:turn_off"
+                if ":" in a:
+                    room, svc = a.split(":", 1)
+                    act_lines.append(
+                        f"{svc.replace('turn_','').upper()} {room} "
+                        f"<span class='subtle'>({reasons.get(room, '?')})</span>"
+                    )
+                else:
+                    act_lines.append(a)
+            act_txt = "<br>".join(act_lines) if act_lines else '<span class="subtle">–</span>'
+            rows += (
+                f'<tr>'
+                f'<td class="subtle">{ts_local}</td>'
+                f'<td><span class="mode mode-{mode}">{mode}</span></td>'
+                f'<td>{rec.get("soc","?")}%</td>'
+                f'<td>{rec.get("battery_power_w","?")} W</td>'
+                f'<td>{rec.get("pv_power_w","?")} W</td>'
+                f'<td>{targets}</td>'
+                f'<td>{act_txt}</td>'
+                f'</tr>'
+            )
+    if not rows:
+        rows = '<tr><td colspan="7" class="subtle">(no decisions logged yet)</td></tr>'
+    body = f"""
+<div class="card">
+  <h1>Recent decisions</h1>
+  <p class="subtle">Last 30 evaluation ticks (newest first). Times shown local. Actions include the reason. Auto-refresh every 60s.</p>
+  <table>
+    <tr><th>Time</th><th>Mode</th><th>SoC</th><th>Battery</th><th>Solar</th><th>Target ON</th><th>Actions (with reason)</th></tr>
+    {rows}
+  </table>
+</div>
+"""
+    return page("Decisions", body, refresh_sec=60)
+
+
+def view_calibrate() -> bytes:
+    s = ha_get("/api/states/sensor.smart_ac_calibration")
+    running = _is_calibration_running()
+    if not s or s.get("state") == "unknown":
+        result_body = '<p class="subtle">No calibration has been run yet.</p>'
+    else:
+        a = s.get("attributes", {})
+        results = a.get("results", {})
+        rows = ""
+        for r, info in results.items():
+            if "error" in info:
+                rows += f'<tr><td>{r}</td><td colspan="3" class="status-err">{info["error"]}</td></tr>'
+            else:
+                rows += (
+                    f'<tr><td>{r}</td>'
+                    f'<td>{info.get("baseline_w")} W</td>'
+                    f'<td>{info.get("running_w")} W</td>'
+                    f'<td class="status-good">{info.get("delta_w"):+} W</td></tr>'
+                )
+        result_body = f"""
+<p class="subtle">Last run: {a.get('run_at','?')} (settle {a.get('settle_before_sec','?')}s / on {a.get('on_duration_sec','?')}s / recover {a.get('settle_after_sec','?')}s)</p>
+<table>
+  <tr><th>Room</th><th>Baseline</th><th>Running</th><th>Delta (est. draw)</th></tr>
+  {rows}
+</table>
+"""
+
+    if running:
+        running_body = f"""
+<div class="card">
+  <h2>Calibration running…</h2>
+  <p class="subtle">Started; check back in ~20 min. Progress log: <code>tail -F {CALIBRATE_STDOUT}</code></p>
+  <pre id="log">{_tail(CALIBRATE_STDOUT, 20)}</pre>
+</div>
+"""
+        refresh = 15
+    else:
+        running_body = f"""
+<div class="card">
+  <h2>Run a new calibration</h2>
+  <p>Takes ~20 minutes. Turns each AC OFF-then-ON in sequence, samples mean load. Best run when the house is quiet.</p>
+  <form method="POST" action="/calibrate">
+    <button type="submit">Start calibration</button>
+  </form>
+</div>
+"""
+        refresh = None
+
+    body = f"""
+<div class="card">
+  <h1>Per-AC calibration</h1>
+  {result_body}
+</div>
+{running_body}
+"""
+    return page("Calibrate", body, refresh_sec=refresh)
+
+
+def view_overrides() -> bytes:
+    # Read from HA's input_datetime helpers (single source of truth).
+    # Any value in the future = active override; anything past (including
+    # the "cleared" 1970-01-01 or a small offset from now) = inactive.
+    rooms = ["master", "guest", "dining", "living", "office", "kyle"]
+    now = dt.datetime.now().astimezone()
+    active_rows = ""
+    for room in rooms:
+        st = ha_get(f"/api/states/input_datetime.ac_{room}_override_until")
+        if not st:
+            continue
+        raw = st.get("state", "")
+        if raw in ("unknown", "unavailable", None, ""):
+            continue
+        try:
+            # input_datetime state is naive local ("YYYY-MM-DD HH:MM:SS")
+            until = dt.datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").astimezone()
+        except Exception:
+            continue
+        if until <= now:
+            continue  # expired / cleared
+        remaining = int((until - now).total_seconds() // 60)
+        active_rows += (
+            f'<tr><td>{room}</td>'
+            f'<td>{until.strftime("%Y-%m-%d %H:%M")}</td>'
+            f'<td>{remaining} min</td>'
+            f'<td><button type="button" onclick="clearOverride(\'{room}\')">Clear</button></td></tr>'
+        )
+    if not active_rows:
+        active_rows = '<tr><td colspan="4" class="subtle">(no active overrides)</td></tr>'
+
+    body = f"""
+<div class="card">
+  <h1>Overrides</h1>
+  <p class="subtle">Explicit pins on an AC's state until a specific time. Set via Telegram (<code>/override &lt;room&gt; until 22:00</code>) or the JSON endpoint.</p>
+  <table>
+    <tr><th>Room</th><th>Until (local)</th><th>Remaining</th><th></th></tr>
+    {active_rows}
+  </table>
+</div>
+<div class="card">
+  <h2>Set a new override</h2>
+  <form method="POST" action="/override" onsubmit="return submitOverride(this)">
+    <label>Room:
+      <select name="room">
+        <option>master</option><option>guest</option><option>dining</option>
+        <option>living</option><option>office</option><option>kyle</option>
+      </select>
+    </label>
+    <label style="margin:0 12px">State:
+      <select name="state">
+        <option value="">(keep current)</option>
+        <option value="on">ON</option>
+        <option value="off">OFF</option>
+      </select>
+    </label>
+    <label style="margin:0 12px">Until:
+      <input type="text" name="until" placeholder="22:00 or +2h">
+    </label>
+    <button type="submit">Set</button>
+  </form>
+  <p class="subtle">If State is set, the AC is flipped to that state immediately (via Alexa routine) AND pinned until the "Until" time. If State is "(keep current)", scheduler is just prevented from touching that AC until the time.</p>
+</div>
+<script>
+function submitOverride(form) {{
+  const room = form.room.value;
+  const state = form.state.value;
+  const until = form.until.value;
+  const body = {{room, until}};
+  if (state) body.state = state;
+  fetch('/override', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(body),
+  }}).then(r => r.json()).then(j => {{
+    if (j.ok) location.reload();
+    else alert('Error: ' + (j.error || 'unknown'));
+  }});
+  return false;
+}}
+function clearOverride(room) {{
+  fetch('/override', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{room, clear: true}}),
+  }}).then(() => location.reload());
+  return false;
+}}
+</script>
+"""
+    return page("Overrides", body, refresh_sec=60)
+
+
+def view_status_json() -> bytes:
+    s = ha_get(f"/api/states/{CFG['status_sensor_entity']}")
+    retro = ha_get("/api/states/sensor.smart_ac_retrospective")
+    calib = ha_get("/api/states/sensor.smart_ac_calibration")
+    return json.dumps({
+        "status": s,
+        "retrospective": retro,
+        "calibration": calib,
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }, default=str).encode()
+
+
+# ---------------------------------------------------------------------- helpers
+
+
+def _is_calibration_running() -> bool:
+    try:
+        result = subprocess.run(["pgrep", "-f", "calibrate.py"],
+                                capture_output=True, timeout=3)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _tail(path: pathlib.Path, n: int) -> str:
+    if not path.exists():
+        return "(no log yet)"
+    try:
+        lines = path.read_text().strip().splitlines()[-n:]
+        return "\n".join(lines).replace("<", "&lt;")
+    except Exception as e:
+        return f"(error reading log: {e})"
+
+
+def start_calibration_in_background() -> None:
+    """Launch calibrate.py as a detached subprocess so it survives past
+    this HTTP request. Logs stdout+stderr to /home/chris/smart_ac/calibrate.log.
+
+    IMPORTANT: forces PYTHONUNBUFFERED=1 so Python's print() line-flushes
+    into the log file instead of block-buffering. Without this, the log
+    stays empty for many minutes (until the process exits or fills ~4KB)
+    and the /calibrate page's tail shows nothing while the run is
+    actually progressing."""
+    if _is_calibration_running():
+        return
+    logf = open(CALIBRATE_STDOUT, "w")
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    subprocess.Popen(
+        [sys.executable, "-u", str(HERE / "calibrate.py")],
+        cwd=str(HERE),
+        env=env,
+        stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# ---------------------------------------------------------------------- overrides
+
+
+def _load_scheduler_state() -> dict:
+    if SCHEDULER_STATE.is_file():
+        try:
+            return json.loads(SCHEDULER_STATE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_scheduler_state(state: dict) -> None:
+    SCHEDULER_STATE.write_text(json.dumps(state, indent=2))
+
+
+def _ha_call(domain: str, service: str, body: dict) -> None:
+    """Fire-and-forget HA REST service call. Used to immediately flip an
+    input_boolean when the override request explicitly asks for a state."""
+    url = f"{CFG['ha_url'].rstrip('/')}/api/services/{domain}/{service}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={
+            "Authorization": f"Bearer {os.environ.get('HA_TOKEN', '')}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        r.read()
+
+
+def parse_override_until(spec: str) -> dt.datetime | None:
+    """Turn a user-supplied time spec into an aware local datetime, or None
+    if unparseable. Supported forms:
+        HH:MM        -> today at HH:MM local (tomorrow if already past)
+        +Nh          -> now + N hours
+        +Nm          -> now + N minutes
+        Nh           -> now + N hours (shorthand)
+        Nm           -> now + N minutes (shorthand)
+    """
+    spec = spec.strip().lower()
+    now_local = dt.datetime.now().astimezone()
+
+    m = re.match(r"^([+])?(\d+)([hm])$", spec)
+    if m:
+        n = int(m.group(2))
+        unit = m.group(3)
+        delta = dt.timedelta(hours=n) if unit == "h" else dt.timedelta(minutes=n)
+        return now_local + delta
+
+    m = re.match(r"^(\d{1,2}):(\d{2})$", spec)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= hh < 24 and 0 <= mm < 60:
+            target = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if target <= now_local:
+                target = target + dt.timedelta(days=1)
+            return target
+
+    return None
+
+
+def apply_override(room: str, until: dt.datetime,
+                   state_to_set: str | None = None) -> None:
+    """Set input_datetime.ac_<room>_override_until via HA REST. HA is the
+    single source of truth for overrides; smart_ac.py reads the same
+    input_datetime helpers on each tick.
+
+    If state_to_set is 'on' or 'off', ALSO immediately flip the matching
+    input_boolean via HA REST so the AC responds now (rather than at the
+    next tick)."""
+    if state_to_set in ("on", "off"):
+        try:
+            _ha_call("input_boolean",
+                     "turn_on" if state_to_set == "on" else "turn_off",
+                     {"entity_id": f"input_boolean.ac_{room}"})
+        except Exception as e:
+            print(f"# ha turn_{state_to_set} failed for {room}: {e}",
+                  file=sys.stderr)
+    # Convert 'until' (already local tz-aware) to the "YYYY-MM-DD HH:MM:SS"
+    # naive-local format input_datetime.set_datetime expects.
+    dt_str = until.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        _ha_call("input_datetime", "set_datetime", {
+            "entity_id": f"input_datetime.ac_{room}_override_until",
+            "datetime": dt_str,
+        })
+    except Exception as e:
+        print(f"# ha set_datetime failed for {room}: {e}", file=sys.stderr)
+
+
+def clear_override(room: str) -> None:
+    # "Clear" = set to a past date (1970). smart_ac treats any past value
+    # as expired and no-longer-in-effect.
+    try:
+        _ha_call("input_datetime", "set_datetime", {
+            "entity_id": f"input_datetime.ac_{room}_override_until",
+            "datetime": "1970-01-01 00:00:00",
+        })
+    except Exception as e:
+        print(f"# ha clear failed for {room}: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------- handler
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _respond(self, code: int, body: bytes, content_type: str = "text/html") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            if path in ("/", ""):
+                self._respond(200, view_dashboard())
+            elif path == "/reports":
+                self._respond(200, view_reports_list())
+            elif path.startswith("/reports/"):
+                self._respond(200, view_report(path[len("/reports/"):]))
+            elif path == "/decisions":
+                self._respond(200, view_decisions())
+            elif path == "/calibrate":
+                self._respond(200, view_calibrate())
+            elif path == "/overrides":
+                self._respond(200, view_overrides())
+            elif path == "/status.json":
+                self._respond(200, view_status_json(), content_type="application/json")
+            elif path == "/healthz":
+                self._respond(200, b"ok\n", content_type="text/plain")
+            else:
+                self.send_error(404)
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            if path == "/calibrate":
+                # Read + discard body if present.
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                start_calibration_in_background()
+                self.send_response(303)
+                self.send_header("Location", "/calibrate")
+                self.end_headers()
+                return
+            if path == "/override":
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                payload = json.loads(body)
+                room = payload.get("room", "").strip().lower()
+                if not room:
+                    self._respond(400, b'{"error":"room required"}', "application/json")
+                    return
+                if payload.get("clear"):
+                    clear_override(room)
+                    self._respond(200,
+                                  json.dumps({"ok": True, "room": room, "cleared": True}).encode(),
+                                  "application/json")
+                    return
+                until_spec = payload.get("until", "").strip()
+                until = parse_override_until(until_spec)
+                if not until:
+                    self._respond(400,
+                                  json.dumps({"error": f"unparseable 'until': {until_spec!r}"}).encode(),
+                                  "application/json")
+                    return
+                state_to_set = payload.get("state")
+                if state_to_set is not None:
+                    state_to_set = str(state_to_set).strip().lower()
+                    if state_to_set not in ("on", "off", ""):
+                        self._respond(
+                            400,
+                            json.dumps({"error": f"bad state: {state_to_set!r}, use 'on' or 'off'"}).encode(),
+                            "application/json",
+                        )
+                        return
+                    if state_to_set == "":
+                        state_to_set = None
+                apply_override(room, until, state_to_set=state_to_set)
+                self._respond(200,
+                              json.dumps({"ok": True, "room": room,
+                                          "until": until.isoformat(),
+                                          "state_set": state_to_set}).encode(),
+                              "application/json")
+                return
+            self.send_error(404)
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write(f"[web] {fmt % args}\n")
+
+
+if __name__ == "__main__":
+    print(f"smart_ac web listening on 0.0.0.0:{PORT}", flush=True)
+    http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

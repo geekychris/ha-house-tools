@@ -1,0 +1,662 @@
+openapi: 3.0.3
+
+info:
+  title: San Felipe smart_ac (HA REST subset)
+  version: "1.0.0"
+  description: |
+    Hand-curated OpenAPI 3 spec covering the Home Assistant REST endpoints
+    that a downstream service needs to consume smart_ac state and control
+    the ACs on the San Felipe HA instance.
+
+    **Scope.** This is NOT the full HA REST surface. It documents just:
+      * The three smart_ac sensor entities (calibration, status,
+        retrospective).
+      * The six per-AC input_boolean toggles and their control services.
+      * The six per-AC input_datetime override-until helpers and the
+        service used to write them.
+      * The three smart_ac scheduler input_boolean flags
+        (enabled / notify_telegram / house_unoccupied).
+
+    **Auth.** All endpoints require a `Bearer <token>` where the token is a
+    Home Assistant long-lived access token (Profile → Security → Long-Lived
+    Access Tokens in the HA UI). Tokens are user-scoped and don't expire
+    unless explicitly revoked.
+
+    **Not spec'd here (use HA docs directly at
+    https://developers.home-assistant.io/docs/api/rest/):**
+      * `/api/history/...`, `/api/logbook/...`, `/api/error_log`
+      * `/api/config/...` (config-flow endpoints)
+      * WebSocket API
+      * Everything outside the smart_ac sensor + input_boolean +
+        input_datetime domains
+
+    **Source of truth.** `sensor.smart_ac_calibration` is written by
+    `pi-sf:/home/chris/smart_ac/calibrate.py`. `sensor.smart_ac_status` is
+    written every 5 min by `smart_ac.py`. `sensor.smart_ac_retrospective`
+    is written nightly by `retrospective.py`. The input_boolean toggles
+    are HA helpers you can flip directly; the scheduler will re-evaluate
+    on its next tick unless you pin the change with the corresponding
+    input_datetime override.
+
+servers:
+  - url: http://ha.example.local:8123
+    description: San Felipe HA (LAN)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: smart_ac
+    description: Sensors written by the smart_ac scheduler on pi-sf
+  - name: control
+    description: Flip ACs / set overrides / toggle scheduler
+  - name: state
+    description: Read AC input_boolean + input_datetime helpers directly
+
+paths:
+
+  # ── Sensor reads ─────────────────────────────────────────────────────
+
+  /api/states/sensor.smart_ac_calibration:
+    get:
+      tags: [smart_ac]
+      summary: Per-AC power calibration
+      description: |
+        Latest per-AC baseline / running / delta watts. Written by
+        `calibrate.py` (v2: isolated-AC + plateau detection). `results`
+        is a `{room: PerRoomCalibration}` map;
+        `sum_positive_delta_w` is the total draw estimate.
+      operationId: getSmartAcCalibration
+      responses:
+        "200":
+          description: Calibration entity state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalibrationEntity"
+
+  /api/states/sensor.smart_ac_status:
+    get:
+      tags: [smart_ac]
+      summary: Current scheduler decision (last 5-min tick)
+      description: |
+        The scheduler's latest evaluation: mode, live inputs, target-on /
+        target-off sets, per-room reasons, and actions taken this tick.
+      operationId: getSmartAcStatus
+      responses:
+        "200":
+          description: Status entity state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusEntity"
+
+  /api/states/sensor.smart_ac_retrospective:
+    get:
+      tags: [smart_ac]
+      summary: Nightly retrospective (per-mode minutes, per-AC runtime, cost)
+      description: |
+        Written each night by `retrospective.py`. Aggregates the day's
+        decisions log + HA history into per-mode minutes, per-AC runtime,
+        per-AC estimated draw, per-AC estimated $ cost, and a
+        recent-actions timeline.
+      operationId: getSmartAcRetrospective
+      responses:
+        "200":
+          description: Retrospective entity state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetrospectiveEntity"
+
+  # ── Per-AC state reads ───────────────────────────────────────────────
+  # (Six near-identical paths per helper family. HA embeds the entity_id
+  # in the path with dots, so each is a distinct resource — no shared
+  # path template. We inline all six per family so codegen sees them as
+  # separate operations, but the response schema is shared.)
+
+  /api/states/input_boolean.ac_master:
+    get:
+      tags: [state]
+      operationId: getAcMaster
+      summary: master AC input_boolean state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputBoolean" }
+  /api/states/input_boolean.ac_guest:
+    get:
+      tags: [state]
+      operationId: getAcGuest
+      summary: guest AC input_boolean state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputBoolean" }
+  /api/states/input_boolean.ac_dining:
+    get:
+      tags: [state]
+      operationId: getAcDining
+      summary: dining AC input_boolean state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputBoolean" }
+  /api/states/input_boolean.ac_living:
+    get:
+      tags: [state]
+      operationId: getAcLiving
+      summary: living AC input_boolean state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputBoolean" }
+  /api/states/input_boolean.ac_office:
+    get:
+      tags: [state]
+      operationId: getAcOffice
+      summary: office AC input_boolean state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputBoolean" }
+  /api/states/input_boolean.ac_kyle:
+    get:
+      tags: [state]
+      operationId: getAcKyle
+      summary: kyle AC input_boolean state
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputBoolean" }
+
+  /api/states/input_datetime.ac_master_override_until:
+    get:
+      tags: [state]
+      operationId: getAcMasterOverrideUntil
+      summary: master override end-time (future = pinned)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputDatetime" }
+  /api/states/input_datetime.ac_guest_override_until:
+    get:
+      tags: [state]
+      operationId: getAcGuestOverrideUntil
+      summary: guest override end-time
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputDatetime" }
+  /api/states/input_datetime.ac_dining_override_until:
+    get:
+      tags: [state]
+      operationId: getAcDiningOverrideUntil
+      summary: dining override end-time
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputDatetime" }
+  /api/states/input_datetime.ac_living_override_until:
+    get:
+      tags: [state]
+      operationId: getAcLivingOverrideUntil
+      summary: living override end-time
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputDatetime" }
+  /api/states/input_datetime.ac_office_override_until:
+    get:
+      tags: [state]
+      operationId: getAcOfficeOverrideUntil
+      summary: office override end-time
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputDatetime" }
+  /api/states/input_datetime.ac_kyle_override_until:
+    get:
+      tags: [state]
+      operationId: getAcKyleOverrideUntil
+      summary: kyle override end-time
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputDatetime" }
+
+  # ── Scheduler flags ──────────────────────────────────────────────────
+
+  /api/states/input_boolean.smart_ac_enabled:
+    get:
+      tags: [state]
+      summary: Scheduler kill-switch (ON = scheduler drives ACs)
+      operationId: getSchedulerEnabled
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InputBoolean"
+
+  /api/states/input_boolean.smart_ac_notify_telegram:
+    get:
+      tags: [state]
+      summary: Push per-decision notifications to Telegram
+      operationId: getSchedulerNotifyTelegram
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InputBoolean"
+
+  /api/states/input_boolean.house_unoccupied:
+    get:
+      tags: [state]
+      summary: House-unoccupied mode (relaxed comfort, capped AC count)
+      operationId: getHouseUnoccupied
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InputBoolean"
+
+  # ── Control (service calls) ──────────────────────────────────────────
+
+  /api/services/input_boolean/turn_on:
+    post:
+      tags: [control]
+      summary: Turn an input_boolean ON
+      description: |
+        For an AC (`input_boolean.ac_<room>`), the
+        `create_ac_toggle_automations.py` automations bridge this to the
+        physical AC via the matching Alexa routine. **Manual flips do not
+        auto-pin** — the scheduler will re-evaluate on its next tick
+        (up to 5 min later) unless you also set an
+        `input_datetime.ac_<room>_override_until` in the future.
+      operationId: inputBooleanTurnOn
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServiceCallEntityBody"
+            examples:
+              turnLivingOn:
+                summary: Turn living AC on
+                value: { entity_id: input_boolean.ac_living }
+              enableScheduler:
+                summary: Re-enable the scheduler
+                value: { entity_id: input_boolean.smart_ac_enabled }
+      responses:
+        "200":
+          description: OK (returns updated entity states affected by the call)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EntityState"
+
+  /api/services/input_boolean/turn_off:
+    post:
+      tags: [control]
+      summary: Turn an input_boolean OFF
+      description: |
+        Same semantics as `turn_on`. See notes there about manual toggles
+        not auto-pinning.
+      operationId: inputBooleanTurnOff
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ServiceCallEntityBody"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EntityState"
+
+  /api/services/input_datetime/set_datetime:
+    post:
+      tags: [control]
+      summary: Set an input_datetime helper (used to pin AC overrides)
+      description: |
+        Write a target datetime to
+        `input_datetime.ac_<room>_override_until`. Any value in the
+        future = that AC is pinned in its current state until the target
+        time. A past value (or the 1970-01-01 sentinel) = no override.
+        The scheduler reads these on every tick. See
+        [SMART_AC.md § Overrides](SMART_AC.md#overrides) for the
+        end-to-end model.
+      operationId: inputDatetimeSetDatetime
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetDatetimeBody"
+            examples:
+              pinLivingUntil23:
+                summary: Pin living AC until 23:00 today
+                value:
+                  entity_id: input_datetime.ac_living_override_until
+                  datetime: "2026-07-01 23:00:00"
+              clearMasterOverride:
+                summary: Clear master override (past sentinel)
+                value:
+                  entity_id: input_datetime.ac_master_override_until
+                  datetime: "1970-01-01 00:00:00"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EntityState"
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: HA long-lived access token
+      description: |
+        Home Assistant long-lived access token. Create one via HA UI:
+        Profile → Security → Long-Lived Access Tokens. Tokens are
+        user-scoped; treat as a password. On the HA host tokens live in
+        `.storage/auth`; scripts in this repo read from `token.txt`
+        (gitignored) or the `HA_TOKEN` env var.
+
+  schemas:
+
+    # ── Base HA entity envelope ─────────────────────────────────────────
+    EntityState:
+      type: object
+      required: [entity_id, state, attributes]
+      properties:
+        entity_id: { type: string, example: sensor.smart_ac_status }
+        state: { type: string, example: SURPLUS }
+        attributes: { type: object, additionalProperties: true }
+        last_changed: { type: string, format: date-time }
+        last_reported: { type: string, format: date-time }
+        last_updated: { type: string, format: date-time }
+        context:
+          type: object
+          properties:
+            id: { type: string }
+            parent_id: { type: string, nullable: true }
+            user_id: { type: string, nullable: true }
+
+    # ── Calibration ─────────────────────────────────────────────────────
+    PerRoomCalibration:
+      type: object
+      description: One AC's calibration measurement
+      properties:
+        baseline_w: { type: integer, description: "House load with all six ACs OFF" }
+        running_w:  { type: integer, description: "House load with just this AC on" }
+        delta_w:    { type: integer, description: "running_w - baseline_w" }
+        on_stable:  { type: boolean, description: "Did the ON reading plateau within max_on_sec?" }
+        on_seconds: { type: integer }
+        recovery_w: { type: integer }
+        recovery_stable:  { type: boolean }
+        recovery_seconds: { type: integer }
+        note:
+          type: string
+          description: |
+            Sanity classification of `delta_w`.
+              * `ok` — within [EXPECTED_AC_W_MIN, EXPECTED_AC_W_MAX]
+              * `NEGATIVE ...` — physically impossible; rerun
+              * `BELOW MIN ...` — AC may not have engaged
+              * `ABOVE MAX ...` — contamination during measurement
+      required: [baseline_w, running_w, delta_w, note]
+
+    CalibrationAttributes:
+      type: object
+      required: [results]
+      properties:
+        friendly_name: { type: string, example: "Smart AC calibration" }
+        icon: { type: string, example: "mdi:speedometer" }
+        run_at: { type: string, format: date-time }
+        method: { type: string, example: "v2 isolated-AC + plateau detection" }
+        poll_interval_sec: { type: number }
+        window_samples: { type: integer }
+        stability_sigma_w: { type: number }
+        min_on_delta_w: { type: number }
+        sum_positive_delta_w:
+          type: integer
+          description: Sum of `delta_w` across all rooms with delta > 0
+        results:
+          type: object
+          description: "Per-room calibration keyed by room slug (master, guest, dining, living, office, kyle)"
+          additionalProperties: { $ref: "#/components/schemas/PerRoomCalibration" }
+
+    CalibrationEntity:
+      allOf:
+        - $ref: "#/components/schemas/EntityState"
+        - type: object
+          properties:
+            state: { type: string, example: measured }
+            attributes: { $ref: "#/components/schemas/CalibrationAttributes" }
+
+    # ── Status ──────────────────────────────────────────────────────────
+    StatusAttributes:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [NIGHT, EVENING, DEFICIT, CHARGE_BEHIND, ON_TRACK, SURPLUS, UNOCC]
+        soc: { type: number, description: "Battery state of charge %" }
+        battery_power_w: { type: integer, description: "Battery draw (negative = discharging)" }
+        pv_power_w: { type: integer }
+        load_w: { type: integer }
+        outdoor_f: { type: number }
+        indoor_f:
+          type: object
+          description: "{room: fahrenheit} for rooms with a temp sensor"
+          additionalProperties: { type: number }
+        enabled: { type: boolean }
+        unoccupied: { type: boolean }
+        notify_telegram: { type: boolean }
+        target_on:
+          type: array
+          items: { type: string }
+          description: "Rooms the scheduler wants ON this tick"
+        target_off:
+          type: array
+          items: { type: string }
+        reasons:
+          type: object
+          description: "{room: human-readable reason for its target state this tick}"
+          additionalProperties: { type: string }
+        actions_this_tick:
+          type: array
+          items: { type: string, example: "living: turn_off" }
+        last_decision_at: { type: string, format: date-time }
+        sunrise: { type: string, format: date-time, description: "Next sunrise" }
+        sunset:  { type: string, format: date-time, description: "Next sunset" }
+
+    StatusEntity:
+      allOf:
+        - $ref: "#/components/schemas/EntityState"
+        - type: object
+          properties:
+            state:
+              type: string
+              description: "Same as `attributes.mode` (redundant, HA convention)"
+            attributes: { $ref: "#/components/schemas/StatusAttributes" }
+
+    # ── Retrospective ───────────────────────────────────────────────────
+    RetroDraw:
+      type: object
+      properties:
+        estimate_w: { type: integer }
+        samples:    { type: integer }
+
+    RetroCost:
+      type: object
+      properties:
+        watts_used:    { type: integer }
+        watts_source:  { type: string, enum: [measured, default] }
+        kwh:           { type: number }
+        usd:           { type: number }
+
+    RetroActionEntry:
+      type: object
+      properties:
+        time:   { type: string, example: "23:05:25" }
+        action: { type: string, example: "turn_off" }
+        room:   { type: string, example: "living" }
+        reason: { type: string, example: "skipped (DEFICIT: battery is discharging during the day)" }
+
+    RetrospectiveAttributes:
+      type: object
+      properties:
+        start:       { type: string, format: date-time }
+        end:         { type: string, format: date-time }
+        start_local: { type: string, example: "2026-06-30 07:00" }
+        end_local:   { type: string, example: "2026-07-01 07:00" }
+        soc_start: { type: number }
+        soc_peak:  { type: number }
+        soc_end:   { type: number }
+        soc_peak_local: { type: string, example: "13:22" }
+        modes_min:
+          type: object
+          description: "{mode: minutes-spent-in-that-mode over the window}"
+          additionalProperties: { type: integer }
+        runtime_min:
+          type: object
+          description: "{room: minutes-that-AC-was-ON over the window}"
+          additionalProperties: { type: integer }
+        draw_w:
+          type: object
+          description: "{room: measured watts from isolated load-delta analysis}"
+          additionalProperties: { $ref: "#/components/schemas/RetroDraw" }
+        costs:
+          type: object
+          description: |
+            Per-room energy + $ estimate. Includes a `_total` key with the
+            sum. `watts_source` says whether the number came from a
+            measured retrospective delta or the config default.
+          additionalProperties: { $ref: "#/components/schemas/RetroCost" }
+        cost_total_kwh: { type: number }
+        cost_total_usd: { type: number }
+        cost_rate_usd_per_kwh: { type: number, example: 0.30 }
+        actions_recent:
+          type: array
+          items: { $ref: "#/components/schemas/RetroActionEntry" }
+        action_count:   { type: integer }
+        decision_count: { type: integer }
+
+    RetrospectiveEntity:
+      allOf:
+        - $ref: "#/components/schemas/EntityState"
+        - type: object
+          properties:
+            attributes: { $ref: "#/components/schemas/RetrospectiveAttributes" }
+
+    # ── Booleans / datetimes (helper entities) ──────────────────────────
+    InputBoolean:
+      allOf:
+        - $ref: "#/components/schemas/EntityState"
+        - type: object
+          properties:
+            state:
+              type: string
+              enum: [on, off]
+
+    InputDatetime:
+      allOf:
+        - $ref: "#/components/schemas/EntityState"
+        - type: object
+          properties:
+            state:
+              type: string
+              description: '"YYYY-MM-DD HH:MM:SS" in HA local timezone, or "unknown"'
+              example: "2026-07-01 23:00:00"
+            attributes:
+              type: object
+              properties:
+                has_date: { type: boolean }
+                has_time: { type: boolean }
+                year:  { type: integer }
+                month: { type: integer }
+                day:   { type: integer }
+                hour:   { type: integer }
+                minute: { type: integer }
+                second: { type: integer }
+                timestamp:
+                  type: number
+                  description: "Unix seconds; 0 = cleared"
+                editable: { type: boolean }
+
+    # ── Service call bodies ─────────────────────────────────────────────
+    ServiceCallEntityBody:
+      type: object
+      required: [entity_id]
+      properties:
+        entity_id:
+          type: string
+          description: |
+            The input_boolean to flip. For ACs, one of
+            `input_boolean.ac_{master,guest,dining,living,office,kyle}`.
+            For scheduler flags, one of
+            `input_boolean.{smart_ac_enabled,smart_ac_notify_telegram,house_unoccupied}`.
+          examples:
+            - input_boolean.ac_living
+            - input_boolean.smart_ac_enabled
+
+    SetDatetimeBody:
+      type: object
+      required: [entity_id, datetime]
+      properties:
+        entity_id:
+          type: string
+          description: |
+            `input_datetime.ac_<room>_override_until` for a room in
+            {master, guest, dining, living, office, kyle}.
+        datetime:
+          type: string
+          description: |
+            Target datetime. HA accepts several formats — the safe form
+            is `"YYYY-MM-DD HH:MM:SS"` in HA's local timezone. Any value
+            in the future pins the room's current state until that time.
+            A past value clears the pin.
+          example: "2026-07-01 23:00:00"

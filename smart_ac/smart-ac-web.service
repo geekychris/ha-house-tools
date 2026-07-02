@@ -1,0 +1,16 @@
+[Unit]
+Description=Smart AC web UI (browsable dashboard + reports + calibration)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chris
+WorkingDirectory=/home/chris/smart_ac
+ExecStart=/usr/bin/python3 /home/chris/smart_ac/web.py
+EnvironmentFile=/home/chris/smart_ac/smart_ac.env
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
