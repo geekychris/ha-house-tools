@@ -15,7 +15,7 @@ state — the repo is the source of truth, not the HA UI.
 - **Root scripts** (`create_telegram_*_command.py`, `setup_*.py`, `apply_tuya_magic_fix.py`, …) — one script per HA change. See [`docs/USAGE.md`](docs/USAGE.md) for what each does and [`docs/INSTALL.md`](docs/INSTALL.md) for the recommended run order.
 - **`smart_ac/`** — 5-minute-tick scheduler that decides which of a house's air conditioners run based on battery SoC / solar surplus / indoor + outdoor temps / time of day. Publishes decisions to a `sensor.smart_ac_*` family in HA and exposes a local web UI + REST API for overrides.
 - **`pi_tts/`** — a stdlib HTTP server that fetches Google Translate TTS and pipes it to `ffplay` on a Raspberry Pi with speakers. Useful when your HA host has no audio out but a spare Pi in another room does.
-- **`docs/`** — architecture ([`DESIGN.md`](docs/DESIGN.md)), daily usage ([`USAGE.md`](docs/USAGE.md)), reinstall procedure ([`INSTALL.md`](docs/INSTALL.md)), smart_ac reference ([`SMART_AC.md`](docs/SMART_AC.md)), OpenAPI 3 spec for the smart_ac REST subset ([`openapi.yaml`](docs/openapi.yaml)).
+- **`docs/`** — architecture ([`DESIGN.md`](docs/DESIGN.md)), programming model + patterns for adding your own scripts ([`PROGRAMMING_MODEL.md`](docs/PROGRAMMING_MODEL.md)), daily usage ([`USAGE.md`](docs/USAGE.md)), reinstall procedure ([`INSTALL.md`](docs/INSTALL.md)), smart_ac reference ([`SMART_AC.md`](docs/SMART_AC.md)), OpenAPI 3 spec for the smart_ac REST subset ([`openapi.yaml`](docs/openapi.yaml)).
 
 ## Requirements
 
