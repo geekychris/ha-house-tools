@@ -295,7 +295,7 @@ def effective_params(snap: Snapshot, cfg: dict) -> dict:
 
     Nap mode is orthogonal: it's applied AFTER decide() picks a target,
     forcibly adding cfg['nap_room'] (default 'master') to the ON list."""
-    if snap.vacation_mode:
+    if getattr(snap, "vacation_mode", False):
         priority = list(cfg["day_priority"])
         if priority:
             shift = snap.now.timetuple().tm_yday % len(priority)
@@ -332,7 +332,7 @@ def effective_params(snap: Snapshot, cfg: dict) -> dict:
             "evening_extras": list(cfg.get("unoccupied_evening_extra_required", [])),
             "mode_label": "UNOCC",
         }
-    if snap.party_mode:
+    if getattr(snap, "party_mode", False):
         # Party mode: always run common areas + a lower comfort target so
         # rooms feel actively cool. Bedrooms too, since we're not filtering
         # out night_min.
@@ -589,12 +589,28 @@ def log_decision(
         "load_w": round(snap.load_w),
         "outdoor_f": round(snap.outdoor_f, 1),
         "indoor_f": {k: round(v, 1) for k, v in snap.indoor_f.items()},
+        "ac_on": dict(snap.ac_on),
         "enabled": snap.enabled,
+        "unoccupied": snap.unoccupied,
+        "target": {r: on for r, on in target.items()},
         "target_on": sorted([r for r, on in target.items() if on]),
         "actions": [f"{r}:{a}" for r, a in actions],
         "reasons": reasons,
     }
     _decisions_logger.info(json.dumps(rec, default=str))
+    # Mirror to SQLite for long-term queries. Best effort -- a DB failure
+    # doesn't affect the tick.
+    conn = _stats_conn()
+    if conn is not None:
+        try:
+            _stats.insert_decision(conn, rec)  # type: ignore
+        except Exception as e:
+            logging.warning("stats.insert_decision failed: %s", e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def push_logbook(cfg: dict, message: str, entity_id: str | None = None) -> None:
@@ -631,6 +647,31 @@ OBSERVATIONS_LOG = pathlib.Path(os.environ.get(
 ))
 OBSERVATION_LAG_MIN = int(os.environ.get("OBSERVATION_LAG_MIN", "3"))
 OBSERVATION_MAX_AGE_MIN = int(os.environ.get("OBSERVATION_MAX_AGE_MIN", "20"))
+
+
+# Optional SQLite mirror. If stats.py can't be imported (e.g. running an
+# old checkout where the module doesn't exist), gracefully fall back to
+# JSONL-only. Every DB write is best-effort and wrapped in try/except so
+# a bad DB never breaks the tick loop.
+try:
+    from . import stats as _stats  # type: ignore
+except (ImportError, ValueError):
+    try:
+        import stats as _stats  # type: ignore
+    except ImportError:
+        _stats = None  # type: ignore
+
+
+def _stats_conn():
+    if _stats is None:
+        return None
+    try:
+        conn = _stats.connect()
+        _stats.init(conn)
+        return conn
+    except Exception as e:
+        logging.warning("stats DB unavailable: %s", e)
+        return None
 
 
 def snap_to_dict(snap: Snapshot, mode: str | None = None) -> dict:
@@ -771,6 +812,18 @@ def process_observations(sched: SchedulerState, snap: Snapshot, mode: str) -> No
             )
         except Exception as e:
             logging.warning("failed to write observation: %s", e)
+        # Mirror to SQLite. Best effort.
+        conn = _stats_conn()
+        if conn is not None:
+            try:
+                _stats.insert_observation(conn, obs)  # type: ignore
+            except Exception as e:
+                logging.warning("stats.insert_observation failed: %s", e)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     sched.pending_observations = still_pending
 
 

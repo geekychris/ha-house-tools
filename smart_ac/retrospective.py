@@ -446,6 +446,83 @@ def make_report(summary: dict) -> str:
             )
         lines.append(f"| **Total** | | | | **{total['kwh']}** | **${total['usd']}** |")
     lines.append("")
+    # Observation-driven analyses. All conditional on having enough data.
+    obs = s.get("observations") or {}
+    if obs and (obs.get("turn_off", {}).get("n") or obs.get("turn_on", {}).get("n")):
+        lines.append("## Actual vs expected (from post-action observations)")
+        lines.append("")
+        lines.append(
+            "For each action, we take a snapshot ~5 min later and compare "
+            "actual load delta to what the calibration would predict."
+        )
+        lines.append("")
+        off = obs.get("turn_off", {})
+        on = obs.get("turn_on", {})
+        if off.get("n"):
+            lines.append(
+                f"- Turn-offs: **{off['n']}** actions, saved "
+                f"**{off['total_saved_w']} W total** "
+                f"(avg {off['avg_saved_w']} W/action)."
+            )
+        if on.get("n"):
+            lines.append(
+                f"- Turn-ons: **{on['n']}** actions, added "
+                f"**{on['total_added_w']} W total** "
+                f"(avg {on['avg_added_w']} W/action)."
+            )
+        net = obs.get("net_load_delta_w", 0)
+        sign = "reduced" if net < 0 else "raised"
+        lines.append(f"- Net effect: {sign} load by **{abs(net)} W** "
+                     f"(sum of individual observations).")
+        lines.append("")
+
+    drift = s.get("drift") or []
+    if drift:
+        drifting = [d for d in drift if d.get("drift_flag")]
+        lines.append("## Calibration drift (last 14 days)")
+        lines.append("")
+        if drifting:
+            lines.append(
+                "**Attention:** the following rooms' actual load "
+                "delta materially differs from calibration. Consider "
+                "rerunning `calibrate.py`."
+            )
+        else:
+            lines.append(
+                "All rooms within ±20% of calibration. Calibration values "
+                "still look representative."
+            )
+        lines.append("")
+        lines.append("| Room | Action | n | Actual (W) | Expected (W) | Diff (W) | Drift % | Flag |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for d in drift:
+            flag = "⚠" if d["drift_flag"] else ""
+            lines.append(
+                f"| {d['room']} | {d['action']} | {d['n']} | "
+                f"{d['avg_actual_w']:+} | {d['avg_expected_w']:+} | "
+                f"{d['avg_diff_w']:+} | {d['drift_pct']} | {flag} |"
+            )
+        lines.append("")
+
+    dynamics = s.get("dynamics") or []
+    if dynamics:
+        lines.append("## Room warm-up dynamics (post-turn-off, °F/min)")
+        lines.append("")
+        lines.append(
+            "How fast each room warms up after the scheduler turns its AC "
+            "off. Useful for tuning precool windows (a fast-warming room "
+            "needs earlier precool)."
+        )
+        lines.append("")
+        lines.append("| Room | Samples | °F / min | Avg outdoor °F |")
+        lines.append("|---|---|---|---|")
+        for d in dynamics:
+            lines.append(
+                f"| {d['room']} | {d['samples']} | "
+                f"{d['f_per_min']:.3f} | {d['avg_outdoor_f']} |"
+            )
+        lines.append("")
+
     actions = s["actions"]
     if actions:
         lines.append(f"## Actions in window ({len(actions)})")
@@ -512,6 +589,30 @@ def main() -> int:
     costs = estimate_costs(runtime, draws, cfg)
     actions = collect_actions(decisions)
 
+    # Observation-driven analyses: pull from the SQLite stats DB if it's
+    # populated. All three sections gracefully degrade to empty dicts
+    # when there's not enough history (fresh install, DB missing, or
+    # <3 samples per room).
+    daily_obs_summary: dict = {}
+    drift: list[dict] = []
+    dynamics: list[dict] = []
+    try:
+        from . import stats as _stats  # type: ignore
+    except (ImportError, ValueError):
+        try:
+            import stats as _stats  # type: ignore
+        except ImportError:
+            _stats = None  # type: ignore
+    if _stats is not None:
+        try:
+            with _stats.opened() as conn:
+                target_day = end.astimezone().date()
+                daily_obs_summary = _stats.daily_action_summary(conn, target_day)
+                drift = _stats.drift_by_room(conn)
+                dynamics = _stats.warm_up_rates(conn)
+        except Exception as e:
+            print(f"# stats query failed: {e}", file=sys.stderr)
+
     summary = {
         "start": start.isoformat(),
         "end": end.isoformat(),
@@ -522,6 +623,9 @@ def main() -> int:
         "costs": costs,
         "actions": actions,
         "decision_count": len(decisions),
+        "observations": daily_obs_summary,
+        "drift": drift,
+        "dynamics": dynamics,
     }
 
     md = make_report(summary)
@@ -586,6 +690,36 @@ def main() -> int:
             "actions_recent": actions_recent,
             "decision_count": summary["decision_count"],
             "report_path": str(out_path),
+            "observations": daily_obs_summary,
+            "drift": drift,
+            "dynamics": dynamics,
+        },
+    )
+
+    # Publish drift + dynamics as their own sensors too so downstream
+    # consumers (SolarSage, alerts, dashboards) can subscribe individually.
+    drift_flagged = [d for d in drift if d.get("drift_flag")]
+    ha_set_state(
+        cfg,
+        "sensor.smart_ac_drift",
+        f"{len(drift_flagged)} flagged" if drift_flagged else "ok",
+        {
+            "friendly_name": "Smart AC calibration drift",
+            "icon": "mdi:tune-vertical",
+            "flagged_rooms": [d["room"] for d in drift_flagged],
+            "rows": drift,
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
+    )
+    ha_set_state(
+        cfg,
+        "sensor.smart_ac_room_dynamics",
+        f"{len(dynamics)} rooms",
+        {
+            "friendly_name": "Smart AC room warm-up dynamics",
+            "icon": "mdi:thermometer-plus",
+            "rows": dynamics,
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         },
     )
     return 0

@@ -1,0 +1,22 @@
+[project]
+name = "ha-house-tools"
+version = "0.1.0"
+description = "Idempotent Python scripts for configuring Home Assistant, plus a solar-aware smart AC scheduler."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Runtime deps are stdlib-only except websockets, which is only used by
+# create_energy_dashboard.py and setup_energy_prefs.py. Kept optional so
+# 90% of the repo runs without any pip install at all.
+dependencies = []
+
+[project.optional-dependencies]
+ws = ["websockets>=13"]
+dev = ["pytest>=8", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/geekychris/ha-house-tools"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

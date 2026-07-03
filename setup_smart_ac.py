@@ -125,6 +125,7 @@ def main() -> None:
         "smart-ac-weekly.timer",
         "web.py",
         "smart-ac-web.service",
+        "stats.py",
     )
     for fname in source_files:
         src = SRC_DIR / fname

@@ -170,6 +170,7 @@ def page(title: str, body: str, refresh_sec: int | None = None) -> bytes:
   <a href="/">Dashboard</a>
   <a href="/reports">Reports</a>
   <a href="/decisions">Decisions</a>
+  <a href="/observations">Observations</a>
   <a href="/overrides">Overrides</a>
   <a href="/calibrate">Calibrate</a>
   <a href="/water">Water</a>
@@ -826,6 +827,152 @@ def view_water(query_params: dict) -> bytes:
                 refresh_sec=60 if is_today else None)
 
 
+def view_observations() -> bytes:
+    """Recent observations + calibration drift + room dynamics.
+    All backed by the smart_ac SQLite stats DB. If the DB is missing or
+    empty (fresh install), renders a hint instead."""
+    try:
+        from . import stats as _stats  # type: ignore
+    except (ImportError, ValueError):
+        try:
+            import stats as _stats  # type: ignore
+        except ImportError:
+            _stats = None  # type: ignore
+    if _stats is None:
+        return page(
+            "Observations",
+            '<div class="card"><h1>Observations</h1>'
+            '<p class="subtle">stats.py module not available in this deploy.</p>'
+            '</div>',
+        )
+    try:
+        with _stats.opened() as conn:
+            today_summary = _stats.daily_action_summary(conn)
+            drift = _stats.drift_by_room(conn)
+            dynamics = _stats.warm_up_rates(conn)
+            rows = _stats.recent_observations(conn, 100)
+            total_obs = conn.execute(
+                "SELECT COUNT(*) FROM observations"
+            ).fetchone()[0]
+    except Exception as e:
+        return page(
+            "Observations",
+            f'<div class="card"><h1>Observations</h1>'
+            f'<p class="status-err">DB query failed: {html.escape(str(e))}</p></div>',
+        )
+
+    def _cls(x: float, warn: float, err: float) -> str:
+        if abs(x) >= err:
+            return "status-err"
+        if abs(x) >= warn:
+            return "status-warn"
+        return "status-good"
+
+    # Today summary card
+    off = today_summary.get("turn_off", {})
+    on = today_summary.get("turn_on", {})
+    summary_body = (
+        f'<p>Today ({today_summary.get("day","?")}): '
+        f'<strong>{off.get("n",0)}</strong> turn-offs saved '
+        f'<strong>{off.get("total_saved_w",0)} W</strong> total '
+        f'(avg {off.get("avg_saved_w",0)} W). '
+        f'<strong>{on.get("n",0)}</strong> turn-ons added '
+        f'<strong>{on.get("total_added_w",0)} W</strong> total '
+        f'(avg {on.get("avg_added_w",0)} W). '
+        f'Net load delta: <strong>{today_summary.get("net_load_delta_w",0)} W</strong>.</p>'
+    )
+
+    drift_rows = ""
+    for d in drift:
+        flag = "⚠" if d["drift_flag"] else ""
+        css = _cls(d["drift_pct"], 15, 30)
+        drift_rows += (
+            f"<tr><td>{d['room']}</td><td>{d['action']}</td><td>{d['n']}</td>"
+            f"<td>{d['avg_actual_w']:+d} W</td><td>{d['avg_expected_w']:+d} W</td>"
+            f"<td>{d['avg_diff_w']:+d} W</td>"
+            f"<td class='{css}'>{d['drift_pct']:.1f}%</td><td>{flag}</td></tr>"
+        )
+    if not drift_rows:
+        drift_rows = "<tr><td colspan='8' class='subtle'>Not enough data yet (need ≥3 observations per room/action).</td></tr>"
+
+    dynamics_rows = ""
+    for d in dynamics:
+        dynamics_rows += (
+            f"<tr><td>{d['room']}</td><td>{d['samples']}</td>"
+            f"<td>{d['f_per_min']:.3f} °F/min</td>"
+            f"<td>{d['avg_outdoor_f']:.1f} °F</td></tr>"
+        )
+    if not dynamics_rows:
+        dynamics_rows = "<tr><td colspan='4' class='subtle'>Not enough post-turn-off samples yet.</td></tr>"
+
+    obs_rows = ""
+    for r in rows:
+        try:
+            ts = dt.datetime.fromisoformat(
+                str(r["ts_observed"]).replace("Z", "+00:00")
+            ).astimezone().strftime("%m-%d %H:%M")
+        except Exception:
+            ts = str(r["ts_observed"])
+        diff_w = int(r["delta_vs_expected_w"] or 0)
+        css = _cls(diff_w, 300, 700)
+        obs_rows += (
+            f"<tr><td>{ts}</td>"
+            f"<td>{html.escape(r['primary_action'])}</td>"
+            f"<td>{html.escape(r['primary_room'])}</td>"
+            f"<td>{html.escape(r['mode_at_action'] or '?')}</td>"
+            f"<td>{r['before_load_w']} W</td>"
+            f"<td>{r['after_load_w']} W</td>"
+            f"<td>{r['delta_load_w']:+d} W</td>"
+            f"<td>{r['expected_delta_w']:+d} W</td>"
+            f"<td class='{css}'>{diff_w:+d} W</td>"
+            f"<td>{html.escape(r['primary_reason'] or '')[:80]}</td></tr>"
+        )
+    if not obs_rows:
+        obs_rows = "<tr><td colspan='10' class='subtle'>No observations yet. Wait for the next tick that fires actions.</td></tr>"
+
+    body = f"""
+<div class="card">
+  <h1>Observations</h1>
+  <p class="subtle">{total_obs} observations in DB. Each row is the actual vs
+  calibration-expected effect of one AC action, measured ~5 min after
+  the scheduler flipped it.</p>
+  {summary_body}
+</div>
+
+<div class="card">
+  <h2>Calibration drift (last 14 days)</h2>
+  <p class="subtle">Rooms whose actual load delta materially differs from
+  calibration. If a row is flagged (⚠), consider re-running calibrate.py.</p>
+  <table>
+    <tr><th>Room</th><th>Action</th><th>n</th><th>Actual</th><th>Expected</th>
+      <th>Diff</th><th>Drift %</th><th></th></tr>
+    {drift_rows}
+  </table>
+</div>
+
+<div class="card">
+  <h2>Room warm-up dynamics</h2>
+  <p class="subtle">°F per minute a room warms up after the AC is turned off.
+  Useful for tuning precool windows (fast-warming rooms need earlier precool).</p>
+  <table>
+    <tr><th>Room</th><th>Samples</th><th>Warm-up rate</th><th>Avg outdoor</th></tr>
+    {dynamics_rows}
+  </table>
+</div>
+
+<div class="card">
+  <h2>Recent observations (last 100)</h2>
+  <table>
+    <tr><th>Time</th><th>Action</th><th>Room</th><th>Mode</th>
+      <th>Before</th><th>After</th><th>Δ</th><th>Expected</th>
+      <th>vs Expected</th><th>Reason</th></tr>
+    {obs_rows}
+  </table>
+</div>
+"""
+    return page("Observations", body, refresh_sec=90)
+
+
 def view_status_json() -> bytes:
     s = ha_get(f"/api/states/{CFG['status_sensor_entity']}")
     retro = ha_get("/api/states/sensor.smart_ac_retrospective")
@@ -1017,6 +1164,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif path == "/water":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 self._respond(200, view_water(query))
+            elif path == "/observations":
+                self._respond(200, view_observations())
             elif path == "/status.json":
                 self._respond(200, view_status_json(), content_type="application/json")
             elif path == "/healthz":
