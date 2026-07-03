@@ -236,6 +236,13 @@ class SchedulerState:
     def __init__(self):
         self.last_action_at: dict[str, str] = {}  # ISO datetime
         self.manual_override_until: dict[str, str] = {}
+        # Queued follow-up observations. Each entry describes an action
+        # (or set of actions) taken on a prior tick, along with the
+        # pre-action Snapshot dict. Next tick that runs OBSERVATION_LAG_MIN
+        # after the action captures an "after" snapshot, computes deltas,
+        # writes one line to observations.jsonl, and drops the entry.
+        # See main tick loop.
+        self.pending_observations: list[dict] = []
 
     @classmethod
     def load(cls) -> "SchedulerState":
@@ -245,6 +252,7 @@ class SchedulerState:
                 d = json.loads(cls.PATH.read_text())
                 s.last_action_at = d.get("last_action_at", {})
                 s.manual_override_until = d.get("manual_override_until", {})
+                s.pending_observations = d.get("pending_observations", [])
             except Exception:
                 pass
         return s
@@ -253,6 +261,7 @@ class SchedulerState:
         self.PATH.write_text(json.dumps({
             "last_action_at": self.last_action_at,
             "manual_override_until": self.manual_override_until,
+            "pending_observations": self.pending_observations,
         }, indent=2))
 
     def get_dt(self, dct: dict[str, str], room: str) -> dt.datetime | None:
@@ -616,6 +625,155 @@ def push_telegram(cfg: dict, message: str) -> None:
         logging.warning("telegram push failed: %s", e)
 
 
+OBSERVATIONS_LOG = pathlib.Path(os.environ.get(
+    "SMART_AC_OBSERVATIONS_LOG",
+    str(pathlib.Path.home() / "smart_ac" / "observations.jsonl"),
+))
+OBSERVATION_LAG_MIN = int(os.environ.get("OBSERVATION_LAG_MIN", "3"))
+OBSERVATION_MAX_AGE_MIN = int(os.environ.get("OBSERVATION_MAX_AGE_MIN", "20"))
+
+
+def snap_to_dict(snap: Snapshot, mode: str | None = None) -> dict:
+    """Compact serialisable snapshot for observation records."""
+    return {
+        "ts": snap.now.astimezone(dt.timezone.utc).isoformat(),
+        "load_w": int(snap.load_w),
+        "pv_power_w": int(snap.pv_power_w),
+        "battery_power_w": int(snap.battery_power_w),
+        "soc": round(snap.soc, 1),
+        "outdoor_f": round(snap.outdoor_f, 1),
+        "indoor_f": {k: round(v, 1) for k, v in snap.indoor_f.items()},
+        "ac_on": dict(snap.ac_on),
+        "mode": mode,
+    }
+
+
+def calibration_expected_delta(actions: list[tuple[str, str]], cfg: dict) -> dict:
+    """Return the expected load delta (W) if the calibration values held
+    perfectly. Positive delta = load should have gone UP.
+    Pulled from sensor.smart_ac_calibration if available, else uses
+    ac_power_estimate_w as fallback."""
+    default_w = float(cfg.get("ac_power_estimate_w", 1000))
+    per_room_w = {}
+    try:
+        calib = ha_get(cfg, "/api/states/sensor.smart_ac_calibration")
+        results = ((calib or {}).get("attributes") or {}).get("results") or {}
+        for room, info in results.items():
+            if isinstance(info, dict) and info.get("note") == "ok":
+                per_room_w[room] = int(info.get("delta_w", default_w))
+    except Exception:
+        pass
+
+    per_action_expected: list[dict] = []
+    total_delta = 0
+    for room, svc in actions:
+        w = per_room_w.get(room, int(default_w))
+        source = "measured" if room in per_room_w else "default"
+        signed = w if svc == "turn_on" else -w
+        total_delta += signed
+        per_action_expected.append({
+            "room": room, "action": svc,
+            "expected_delta_w": signed,
+            "watts_source": source,
+        })
+    return {
+        "total_expected_delta_w": total_delta,
+        "per_action": per_action_expected,
+    }
+
+
+def enqueue_observation(
+    sched: SchedulerState,
+    snap: Snapshot,
+    mode: str,
+    reasons: dict[str, str],
+    actions: list[tuple[str, str]],
+    cfg: dict,
+) -> None:
+    """Record the pre-action state + action list so a later tick can
+    measure the after-state and compute deltas. Called from the tick
+    loop only when actions actually fired."""
+    if not actions:
+        return
+    entry = {
+        "ts_action": snap.now.astimezone(dt.timezone.utc).isoformat(),
+        "actions": [
+            {"room": r, "action": s, "reason": reasons.get(r, "?"), "mode": mode}
+            for (r, s) in actions
+        ],
+        "before": snap_to_dict(snap, mode),
+        "expected": calibration_expected_delta(actions, cfg),
+    }
+    sched.pending_observations.append(entry)
+
+
+def process_observations(sched: SchedulerState, snap: Snapshot, mode: str) -> None:
+    """Consume any pending observations that are old enough to measure.
+    For each, compute deltas against the current snapshot, write one
+    JSON line to observations.jsonl, and drop the pending entry.
+    Also drops entries older than OBSERVATION_MAX_AGE_MIN as stale
+    (e.g. after a long outage), rather than measuring against an
+    unrelated snapshot."""
+    if not sched.pending_observations:
+        return
+    now = snap.now
+    still_pending: list[dict] = []
+    OBSERVATIONS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    for entry in sched.pending_observations:
+        try:
+            ts_action = parse_dt(entry["ts_action"])
+        except Exception:
+            continue
+        age_min = (now - ts_action).total_seconds() / 60
+        if age_min < OBSERVATION_LAG_MIN:
+            still_pending.append(entry)
+            continue
+        if age_min > OBSERVATION_MAX_AGE_MIN:
+            logging.info("dropping stale observation (age %.1fm > %d): actions=%s",
+                         age_min, OBSERVATION_MAX_AGE_MIN,
+                         [(a["room"], a["action"]) for a in entry["actions"]])
+            continue
+
+        before = entry["before"]
+        after = snap_to_dict(snap, mode)
+        deltas = {
+            "load_w": after["load_w"] - before["load_w"],
+            "battery_power_w": after["battery_power_w"] - before["battery_power_w"],
+            "pv_power_w": after["pv_power_w"] - before["pv_power_w"],
+            "soc": round(after["soc"] - before["soc"], 2),
+            "outdoor_f": round(after["outdoor_f"] - before["outdoor_f"], 1),
+            "indoor_f": {
+                r: round(after["indoor_f"].get(r, 0) - before["indoor_f"].get(r, 0), 1)
+                for r in set(before["indoor_f"]) | set(after["indoor_f"])
+            },
+        }
+        expected_delta = entry["expected"].get("total_expected_delta_w", 0)
+        obs = {
+            "ts_observed": now.astimezone(dt.timezone.utc).isoformat(),
+            "age_min": round(age_min, 1),
+            "actions": entry["actions"],
+            "before": before,
+            "after": after,
+            "deltas": deltas,
+            "expected": entry["expected"],
+            "delta_vs_expected_w": deltas["load_w"] - expected_delta,
+        }
+        try:
+            with OBSERVATIONS_LOG.open("a") as f:
+                f.write(json.dumps(obs, default=str) + "\n")
+            logging.info(
+                "observation: %s -> load %+dW (expected %+dW, diff %+dW), soc %+.2f%%",
+                ", ".join(f"{a['action']}:{a['room']}" for a in entry["actions"]),
+                deltas["load_w"],
+                expected_delta,
+                deltas["load_w"] - expected_delta,
+                deltas["soc"],
+            )
+        except Exception as e:
+            logging.warning("failed to write observation: %s", e)
+    sched.pending_observations = still_pending
+
+
 def publish_status(
     snap: Snapshot,
     mode: str,
@@ -675,12 +833,22 @@ def main() -> int:
             # specific time) can update it between ticks.
             sched = SchedulerState.load()
             snap = Snapshot(cfg)
+            # Consume any pending observations from prior ticks BEFORE we
+            # act again. Uses the fresh snapshot as the "after" state.
+            # We pass in the mode from decide() below via a re-check, but
+            # for observation timing what matters is `now` and the
+            # pre-computed mode label; we approximate with "?" here since
+            # decide() runs next -- the observation record already captured
+            # the mode at action-time in `before`.
+            process_observations(sched, snap, mode="?")
             target, mode, reasons = decide(snap, sched, cfg)
             actions: list[tuple[str, str]] = []
             if snap.enabled:
                 actions = apply_targets(target, snap, sched, cfg)
             else:
                 logging.info("disabled (preview mode); not applying actions")
+            # Queue this tick's actions for observation on the next tick.
+            enqueue_observation(sched, snap, mode, reasons, actions, cfg)
             sched.save()
             publish_status(snap, mode, target, actions, reasons, cfg)
             log_decision(snap, mode, target, actions, reasons)
