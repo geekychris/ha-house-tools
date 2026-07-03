@@ -1,0 +1,16 @@
+{
+  "_comment": "weather config -- copy to weather.json, edit for your location, then sudo systemctl restart weather.timer",
+
+  "_latlon_comment": "Latitude / longitude in decimal degrees. Look up your house location on any map service.",
+  "latitude": 30.5,
+  "longitude": -114.5,
+
+  "_timezone_comment": "IANA timezone (e.g. America/Los_Angeles, Europe/Amsterdam) or 'auto'.",
+  "timezone": "auto",
+
+  "_panel_comment": "Nameplate DC peak of your PV array in kW. Used to convert Open-Meteo shortwave radiation (W/m^2) into an expected AC output figure. E.g. 6x 400W panels = 2.4 kW.",
+  "panel_kw": 15.0,
+
+  "_efficiency_comment": "End-to-end system efficiency (inverter + wiring + soiling + off-angle). 0.7-0.85 is typical.",
+  "system_efficiency": 0.75
+}

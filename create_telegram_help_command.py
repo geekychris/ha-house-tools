@@ -48,9 +48,10 @@ Home Assistant bot commands
 
 STATUS
   /status - snapshot: power, temps, water, lights on now
-  /water - tank depth + usage over 24h/3d/7d
+  /water - tank depth + usage over 24h/3d/7d + days-until-empty projection
   /smart_ac - scheduler's current decision + reasoning
   /smart_ac_report - last night's retrospective + cost
+  /smart_ac_weekly - last week's rollup: mode-minutes + total cost
 
 LIGHTS AND SWITCHES
   /on <name> - turn on by substring match
@@ -74,6 +75,14 @@ AIR CONDITIONERS
     examples: /override living on until 23:00   (turns on + pins)
               /override master for 2h           (pins current state)
               /override kyle clear
+
+MODES (toggle from the HA dashboard)
+  input_boolean.smart_ac_party_mode - looser comfort, always run
+    living + dining (75F target).
+  input_boolean.smart_ac_nap_mode - flip on and master AC gets pinned
+    for 60m of turbo cooling, then auto-clears.
+  input_boolean.smart_ac_vacation_mode - stricter than the classic
+    house_unoccupied: max 1 AC, 84F target.
 
 SPEAKING
   /say [room] <text> - Alexa (no chime)

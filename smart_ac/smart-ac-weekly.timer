@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly smart_ac rollup (fires Monday 00:45)
+Requires=smart-ac-weekly.service
+
+[Timer]
+OnCalendar=Mon *-*-* 00:45:00
+Persistent=true
+Unit=smart-ac-weekly.service
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

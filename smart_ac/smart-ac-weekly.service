@@ -1,0 +1,13 @@
+[Unit]
+Description=Smart AC weekly rollup (aggregates last 7 daily reports)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/chris/smart_ac
+EnvironmentFile=/home/chris/smart_ac/smart_ac.env
+ExecStart=/usr/bin/python3 /home/chris/smart_ac/weekly.py
+User=chris
+
+[Install]
+WantedBy=multi-user.target

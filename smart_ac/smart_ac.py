@@ -182,6 +182,13 @@ class Snapshot:
         unocc_state = states.get(cfg.get("unoccupied_entity", ""), {}).get("state", "off")
         self.unoccupied = unocc_state == "on"
 
+        # Optional mode toggles (see setup_smart_ac_modes.py). All default
+        # off; the scheduler falls back to normal behaviour if the helpers
+        # don't exist.
+        self.party_mode = states.get("input_boolean.smart_ac_party_mode", {}).get("state") == "on"
+        self.nap_mode = states.get("input_boolean.smart_ac_nap_mode", {}).get("state") == "on"
+        self.vacation_mode = states.get("input_boolean.smart_ac_vacation_mode", {}).get("state") == "on"
+
         # AC current states + when each last changed
         all_rooms = sorted(set(cfg["night_min_acs"]) | set(cfg["day_priority"]))
         self.ac_on: dict[str, bool] = {}
@@ -266,9 +273,37 @@ def room_needs_cooling(
 
 
 def effective_params(snap: Snapshot, cfg: dict) -> dict:
-    """Returns the in-effect knobs for this tick. In unoccupied mode, several
-    config keys are overridden + the priority list is rotated daily so each
-    AC takes equal turns as the "first added" extra."""
+    """Returns the in-effect knobs for this tick.
+
+    Mode precedence (first match wins):
+      1. vacation_mode   -- stricter than unoccupied: tighter max, larger
+         comfort target. Setup via setup_smart_ac_modes.py.
+      2. unoccupied      -- the classic "away" mode. Toggle:
+         input_boolean.house_unoccupied.
+      3. party_mode      -- comfortable common areas + relaxed comfort.
+         Toggle: input_boolean.smart_ac_party_mode.
+      4. normal          -- the default.
+
+    Nap mode is orthogonal: it's applied AFTER decide() picks a target,
+    forcibly adding cfg['nap_room'] (default 'master') to the ON list."""
+    if snap.vacation_mode:
+        priority = list(cfg["day_priority"])
+        if priority:
+            shift = snap.now.timetuple().tm_yday % len(priority)
+            priority = priority[shift:] + priority[:shift]
+        night_min = list(cfg.get("vacation_night_min_acs", []))
+        return {
+            "night_min": night_min,
+            "evening_min": list(cfg.get("vacation_evening_min_acs", night_min)),
+            "priority": priority,
+            "comfort_target_f": cfg.get("vacation_comfort_target_f", 84),
+            "outdoor_hot": cfg.get(
+                "vacation_unsensored_assume_hot_above_outdoor_f", 92
+            ),
+            "max_total": cfg.get("vacation_max_acs_total", 1),
+            "evening_extras": list(cfg.get("vacation_evening_extra_required", [])),
+            "mode_label": "VACATION",
+        }
     if snap.unoccupied:
         priority = list(cfg["day_priority"])
         if priority:
@@ -287,6 +322,22 @@ def effective_params(snap: Snapshot, cfg: dict) -> dict:
             "max_total": cfg.get("unoccupied_max_acs_total"),
             "evening_extras": list(cfg.get("unoccupied_evening_extra_required", [])),
             "mode_label": "UNOCC",
+        }
+    if snap.party_mode:
+        # Party mode: always run common areas + a lower comfort target so
+        # rooms feel actively cool. Bedrooms too, since we're not filtering
+        # out night_min.
+        night_min = list(cfg.get("party_night_min_acs",
+                                 cfg["night_min_acs"] + ["living", "dining"]))
+        return {
+            "night_min": night_min,
+            "evening_min": list(cfg.get("party_evening_min_acs", night_min)),
+            "priority": list(cfg["day_priority"]),
+            "comfort_target_f": cfg.get("party_comfort_target_f", 75),
+            "outdoor_hot": cfg["unsensored_assume_hot_above_outdoor_f"],
+            "max_total": None,
+            "evening_extras": list(cfg.get("party_evening_extra_required", night_min)),
+            "mode_label": "PARTY",
         }
     night_min = list(cfg["night_min_acs"])
     return {

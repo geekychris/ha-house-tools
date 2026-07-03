@@ -1,0 +1,12 @@
+[Unit]
+Description=Fire weather.service every 30 min
+Requires=weather.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+Unit=weather.service
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

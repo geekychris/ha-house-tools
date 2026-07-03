@@ -527,10 +527,21 @@ def main() -> int:
     md = make_report(summary)
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    fname = end.astimezone().strftime("%Y-%m-%d") + ".md"
-    out_path = REPORTS_DIR / fname
+    day_stem = end.astimezone().strftime("%Y-%m-%d")
+    out_path = REPORTS_DIR / (day_stem + ".md")
     out_path.write_text(md)
     print(f"# wrote {out_path}", file=sys.stderr)
+
+    # JSON sidecar: same summary, machine-readable. weekly.py aggregates
+    # by scanning these instead of parsing the markdown. Keep the shape
+    # stable -- other tools depend on the keys here.
+    json_path = REPORTS_DIR / (day_stem + ".json")
+    json_path.write_text(json.dumps({
+        "day": day_stem,
+        **summary,
+    }, default=str, indent=2))
+    print(f"# wrote {json_path}", file=sys.stderr)
+
     print(md)
 
     # Latest N actions with reason -- surfaced in the /smart_ac_report

@@ -136,6 +136,11 @@ def main() -> None:
         *py("setup_ac_override_input_datetimes.py"),
         env_extra={"HA_URL": ws_url},
     )
+    run(
+        "Phase 2.6: Smart AC mode toggles (party / nap / vacation)",
+        *py("setup_smart_ac_modes.py"),
+        env_extra={"HA_URL": ws_url},
+    )
 
     # ── Phase 3: Automations ---------------------------------------------------
     automation_scripts = [
@@ -151,12 +156,27 @@ def main() -> None:
         "create_telegram_ac_command.py",
         "create_telegram_smart_ac_command.py",
         "create_telegram_smart_ac_report_command.py",
+        "create_telegram_smart_ac_weekly_command.py",
         "create_telegram_override_command.py",
         "create_telegram_battery_alert.py",
         "create_ac_toggle_automations.py",
+        "create_smart_ac_nap_mode_automation.py",
+        "create_sleep_window_automations.py",
+        # Solar-surplus + Z-Wave notification logger are optional; they land
+        # here so a fresh install has the code but only fires when the
+        # relevant HACS integrations / hardware are present.
+        "create_solar_surplus_automation.py",
+        "create_zwave_notification_logger_automation.py",
     ]
     for s in automation_scripts:
         run(f"Phase 3: {s}", *py(s))
+
+    # ── Phase 3.5: Weather (Open-Meteo) service on pi-sf ---------------------
+    if not skip_pi_sf:
+        run(
+            "Phase 3.5: Deploy Open-Meteo weather fetcher to pi (scp only)",
+            *py("setup_weather.py"),
+        )
 
     # ── Phase 4: BotFather command autocomplete --------------------------------
     run(

@@ -32,11 +32,21 @@
   "notify_target": "notify.telegram",
 
   "unoccupied_entity": "input_boolean.house_unoccupied",
-  "_unoccupied_comment": "Vacation / no-one-home mode: relaxed targets, fewer ACs at once, daily rotation across priority to spread wear.",
+  "_unoccupied_comment": "Classic no-one-home mode: relaxed targets, fewer ACs at once, daily rotation across priority to spread wear.",
   "unoccupied_night_min_acs": [],
   "unoccupied_max_acs_total": 2,
   "unoccupied_comfort_target_f": 82,
   "unoccupied_unsensored_assume_hot_above_outdoor_f": 90,
+
+  "_vacation_comment": "Stricter than unoccupied. Triggered by input_boolean.smart_ac_vacation_mode. Intended for extended absences where saving battery matters more than keeping the house cool.",
+  "vacation_night_min_acs": [],
+  "vacation_max_acs_total": 1,
+  "vacation_comfort_target_f": 84,
+  "vacation_unsensored_assume_hot_above_outdoor_f": 92,
+
+  "_party_comment": "Triggered by input_boolean.smart_ac_party_mode. Adds common-area ACs to the always-run set and lowers the comfort target.",
+  "party_night_min_acs": ["master", "kids", "guest", "living", "dining"],
+  "party_comfort_target_f": 75,
 
   "_sensor_map_comment": "Per-room temperature sensor entity IDs (or omit a room to use outdoor + heuristic).",
   "indoor_sensor_for_room": {

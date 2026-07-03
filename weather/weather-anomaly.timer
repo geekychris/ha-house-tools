@@ -1,0 +1,12 @@
+[Unit]
+Description=Fire weather-anomaly.service every 15 min
+Requires=weather-anomaly.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=weather-anomaly.service
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

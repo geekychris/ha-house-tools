@@ -1,0 +1,13 @@
+[Unit]
+Description=Fridge / residual-load monitor
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/chris/weather
+EnvironmentFile=/home/chris/weather/weather.env
+ExecStart=/usr/bin/python3 /home/chris/weather/fridge_monitor.py
+User=chris
+
+[Install]
+WantedBy=multi-user.target

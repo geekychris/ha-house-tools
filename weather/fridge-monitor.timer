@@ -1,0 +1,12 @@
+[Unit]
+Description=Fire fridge-monitor.service every 15 min
+Requires=fridge-monitor.service
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=15min
+Unit=fridge-monitor.service
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

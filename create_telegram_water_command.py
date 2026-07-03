@@ -105,7 +105,23 @@ Water tank
 Used vs peak in window:
   {{{{ usage('24h', '{MAX_24H}', 1) }}}}
   {{{{ usage('3d ', '{MAX_3D}', 3) }}}}
-  {{{{ usage('7d ', '{MAX_7D}', 7) }}}}\
+  {{{{ usage('7d ', '{MAX_7D}', 7) }}}}
+
+Projection (at 7d rate):
+{{% set now_ft = states('{WATER_DEPTH}') | float(0) %}}
+{{% set now_gal = now_ft * {WATER_GAL_PER_FOOT} %}}
+{{% set max_7d_ft = states('{MAX_7D}') | float(0) %}}
+{{% set drop_7d_ft = max_7d_ft - now_ft %}}
+{{% set drop_7d_gal = drop_7d_ft * {WATER_GAL_PER_FOOT} %}}
+{{% if drop_7d_gal > 5 %}}\
+{{% set gal_per_day = drop_7d_gal / 7 %}}\
+{{% set days_left = (now_gal / gal_per_day) | round(1) %}}
+  {{{{ days_left }}}} days until empty (empties around \
+{{{{ (now() + timedelta(days=days_left)).strftime('%a %b %d') }}}})\
+{{% if days_left < 3 %}} -- CALL THE WATER TRUCK{{% elif days_left < 7 %}} -- schedule refill soon{{% endif %}}
+{{% else %}}\
+  stable / net gain -- no drain to project from
+{{% endif %}}\
 """
 
 

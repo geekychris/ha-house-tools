@@ -120,6 +120,9 @@ def main() -> None:
         "calibrate.py",
         "smart-ac-retrospective.service",
         "smart-ac-retrospective.timer",
+        "weekly.py",
+        "smart-ac-weekly.service",
+        "smart-ac-weekly.timer",
         "web.py",
         "smart-ac-web.service",
     )
