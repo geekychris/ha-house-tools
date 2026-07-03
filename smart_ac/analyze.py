@@ -4,8 +4,11 @@ Command-line query tool for the smart_ac stats DB.
 
 Presets:
   summary                 Today's action summary + net effect.
-  drift                   Per-room calibration drift (last 14 days).
+  drift                   Per-room calibration drift (last 14 days, mean-based).
   dynamics                Per-room warm-up rate (last 30 days).
+  rolling [n]             Per-room rolling stats over last N isolated observations
+                          (default 20). Includes median + min/max + stddev --
+                          robust to fridge / water pump noise.
   mode-time [days]        Minutes in each mode over the last N days (default 30).
   room-cost [days]        Per-room cost over the last N days (default 30).
   cost-trend [days]       Day-by-day kWh / $ trend.
@@ -232,10 +235,43 @@ def _cmd_sql(args: list[str]) -> int:
     return 0
 
 
+def _cmd_rolling(args: list[str]) -> int:
+    n = int(args[0]) if args else 20
+    with stats.opened() as conn:
+        rows = stats.rolling_stats_per_room_action(conn, n_samples=n)
+        summary = stats.rolling_stats_summary(conn, n_samples=n * 5)
+    if not rows:
+        print(f"(no isolated observations yet)")
+        return 0
+    if summary.get("n", 0) > 0:
+        act = summary["actual"]
+        dif = summary["diff"]
+        print(f"Cross-room summary (last {summary['n']} isolated observations):")
+        print(f"  actual: median {act['median']:+d} W, stddev {act['stddev']}, "
+              f"range [{act['min']:+d}, {act['max']:+d}]")
+        print(f"  diff:   median {dif['median']:+d} W, stddev {dif['stddev']}, "
+              f"range [{dif['min']:+d}, {dif['max']:+d}]")
+        print()
+    view = [{
+        "room": r["room"],
+        "action": r["action"],
+        "n": r["n_samples"],
+        "act_median": r["actual"].get("median", 0),
+        "act_stddev": r["actual"].get("stddev", 0),
+        "act_min": r["actual"].get("min", 0),
+        "act_max": r["actual"].get("max", 0),
+        "diff_median": r["diff"].get("median", 0),
+        "diff_stddev": r["diff"].get("stddev", 0),
+    } for r in rows]
+    _print_table(view, list(view[0].keys()))
+    return 0
+
+
 COMMANDS = {
     "summary": _cmd_summary,
     "drift": _cmd_drift,
     "dynamics": _cmd_dynamics,
+    "rolling": _cmd_rolling,
     "mode-time": _cmd_mode_time,
     "room-cost": _cmd_room_cost,
     "cost-trend": _cmd_cost_trend,

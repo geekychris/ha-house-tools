@@ -135,6 +135,45 @@ def test_prune(tmp_path: pathlib.Path):
         assert n_after == 1
 
 
+def test_rolling_stats_median_min_max(tmp_path: pathlib.Path):
+    with stats.opened(tmp_path / "stats.sqlite3") as conn:
+        # Insert 5 observations for (living, turn_off) with varied deltas.
+        # Actual load deltas: -1200, -900, -3500 (fridge spike outlier),
+        # -1100, -1000. Median should filter the -3500 outlier.
+        for i, actual in enumerate([-1200, -900, -3500, -1100, -1000]):
+            conn.execute(
+                "INSERT INTO observations ("
+                "ts_observed, ts_action, age_min, n_actions, actions_json, "
+                "primary_room, primary_action, primary_reason, mode_at_action, "
+                "before_load_w, after_load_w, delta_load_w, "
+                "expected_delta_w, delta_vs_expected_w, "
+                "before_soc, after_soc, delta_soc, "
+                "before_outdoor_f, after_outdoor_f, delta_indoor_f_room, raw_json) "
+                "VALUES (?, ?, 5, 1, '[]', 'living', 'turn_off', 'r', 'MODE', "
+                "3500, ?, ?, -1252, ?, 80, 80, 0, 90, 91, 0.2, '{}')",
+                (f"2026-07-{20 + i}T10:00:00", f"a{i}",
+                 3500 + actual, actual, actual - (-1252)),
+            )
+        conn.commit()
+
+        rolling = stats.rolling_stats_per_room_action(conn, n_samples=10)
+        assert len(rolling) == 1
+        row = rolling[0]
+        assert row["room"] == "living"
+        assert row["action"] == "turn_off"
+        assert row["n_samples"] == 5
+        # Median of [-3500,-1200,-1100,-1000,-900] = -1100 (much less affected
+        # by the -3500 outlier than the mean which is -1540).
+        assert row["actual"]["median"] == -1100
+        assert row["actual"]["min"] == -3500
+        assert row["actual"]["max"] == -900
+        assert row["actual"]["n"] == 5
+
+        summary = stats.rolling_stats_summary(conn, n_samples=100)
+        assert summary["n"] == 5
+        assert summary["actual"]["median"] == -1100
+
+
 def test_backfill_from_jsonl(tmp_path: pathlib.Path):
     dpath = tmp_path / "decisions.log"
     opath = tmp_path / "observations.jsonl"

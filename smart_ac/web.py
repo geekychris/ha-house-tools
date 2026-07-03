@@ -850,6 +850,8 @@ def view_observations() -> bytes:
             today_summary = _stats.daily_action_summary(conn)
             drift = _stats.drift_by_room(conn)
             dynamics = _stats.warm_up_rates(conn)
+            rolling = _stats.rolling_stats_per_room_action(conn, n_samples=20)
+            rolling_summary = _stats.rolling_stats_summary(conn, n_samples=100)
             rows = _stats.recent_observations(conn, 100)
             total_obs = conn.execute(
                 "SELECT COUNT(*) FROM observations"
@@ -905,6 +907,47 @@ def view_observations() -> bytes:
     if not dynamics_rows:
         dynamics_rows = "<tr><td colspan='4' class='subtle'>Not enough post-turn-off samples yet.</td></tr>"
 
+    # Rolling stats per (room, action). Median filters fridge/pump noise.
+    rolling_rows = ""
+    for x in rolling:
+        act = x["actual"]
+        dif = x["diff"]
+        css = _cls(dif.get("median", 0), 200, 500)
+        rolling_rows += (
+            f"<tr><td>{html.escape(x['room'])}</td>"
+            f"<td>{html.escape(x['action'])}</td>"
+            f"<td>{x['n_samples']}</td>"
+            f"<td>{act.get('median', 0):+d}</td>"
+            f"<td>{act.get('mean', 0):+d}</td>"
+            f"<td>{act.get('stddev', 0)}</td>"
+            f"<td>{act.get('min', 0):+d}</td>"
+            f"<td>{act.get('max', 0):+d}</td>"
+            f"<td class='{css}'>{dif.get('median', 0):+d}</td>"
+            f"<td>{dif.get('stddev', 0)}</td></tr>"
+        )
+    if not rolling_rows:
+        rolling_rows = "<tr><td colspan='10' class='subtle'>Not enough data yet.</td></tr>"
+
+    # Cross-room summary: overall noise floor across last 100 obs.
+    r_all = rolling_summary
+    if r_all.get("n", 0) > 0:
+        act_all = r_all["actual"]
+        dif_all = r_all["diff"]
+        rolling_summary_html = (
+            f"<p>Across last {r_all['n']} isolated observations "
+            f"(<code>n_actions=1</code>): "
+            f"actual median <strong>{act_all['median']:+d} W</strong> "
+            f"(stddev {act_all['stddev']}, range {act_all['min']:+d} to {act_all['max']:+d}). "
+            f"Diff vs expected: median <strong>{dif_all['median']:+d} W</strong> "
+            f"(stddev {dif_all['stddev']}, range {dif_all['min']:+d} to {dif_all['max']:+d}). "
+            f"A low |median diff| and stddev under ~300 W means calibration is holding "
+            f"against fridge/pump noise; wide stddev = high measurement uncertainty.</p>"
+        )
+    else:
+        rolling_summary_html = (
+            '<p class="subtle">Not enough isolated observations yet.</p>'
+        )
+
     obs_rows = ""
     for r in rows:
         try:
@@ -937,6 +980,23 @@ def view_observations() -> bytes:
   calibration-expected effect of one AC action, measured ~5 min after
   the scheduler flipped it.</p>
   {summary_body}
+</div>
+
+<div class="card">
+  <h2>Rolling stats (last 20 obs per room+action)</h2>
+  <p class="subtle">Robust to fridge / water-pump noise: the median column
+  is much less affected by one-off spikes than the mean. High stddev
+  means "we can't pin this room's calibration confidently yet"; it does
+  not necessarily mean drift. Only isolated (single-AC transition)
+  observations are included here.</p>
+  {rolling_summary_html}
+  <table>
+    <tr><th>Room</th><th>Action</th><th>n</th>
+      <th>Actual median</th><th>Actual mean</th><th>Actual stddev</th>
+      <th>Actual min</th><th>Actual max</th>
+      <th>Diff median</th><th>Diff stddev</th></tr>
+    {rolling_rows}
+  </table>
 </div>
 
 <div class="card">

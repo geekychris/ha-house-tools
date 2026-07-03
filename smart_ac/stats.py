@@ -660,6 +660,121 @@ def prune(
     return deleted
 
 
+def rolling_stats_per_room_action(
+    conn: sqlite3.Connection,
+    n_samples: int = 20,
+    isolated_only: bool = True,
+) -> list[dict]:
+    """Rolling stats over the LAST `n_samples` observations for each
+    (room, action) pair. Includes both actual load delta and
+    delta_vs_expected -- the latter is more useful for calibration
+    drift (median filters the fridge/pump spike outliers).
+
+    isolated_only=True limits to n_actions=1 samples, which strip out
+    ticks where multiple ACs transitioned at once (harder to attribute).
+
+    Returned rows include: n, mean/median/stddev/min/max for each of
+    delta_load_w and delta_vs_expected_w.
+    """
+    import statistics as st
+
+    # Pull raw values, sorted newest-first, capped at n_samples per group.
+    # SQLite lacks MEDIAN / PERCENTILE, so we compute in Python. Volumes
+    # are tiny (< a few hundred rows per room/action typically).
+    filter_iso = "AND n_actions = 1" if isolated_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT primary_room, primary_action,
+               delta_load_w, expected_delta_w, delta_vs_expected_w
+        FROM observations
+        WHERE 1=1 {filter_iso}
+        ORDER BY primary_room, primary_action, ts_observed DESC
+        """
+    ).fetchall()
+
+    from collections import defaultdict
+    grouped: dict[tuple, list[dict]] = defaultdict(list)
+    for r in rows:
+        k = (r["primary_room"], r["primary_action"])
+        if len(grouped[k]) < n_samples:
+            grouped[k].append(dict(r))
+
+    out: list[dict] = []
+    for (room, action), items in grouped.items():
+        actuals = [int(x["delta_load_w"]) for x in items]
+        expecteds = [int(x["expected_delta_w"]) for x in items]
+        diffs = [int(x["delta_vs_expected_w"]) for x in items]
+
+        def s(vals: list[int]) -> dict:
+            if not vals:
+                return {"n": 0}
+            return {
+                "n": len(vals),
+                "mean": round(st.mean(vals)),
+                "median": round(st.median(vals)),
+                "stddev": round(st.pstdev(vals)) if len(vals) > 1 else 0,
+                "min": min(vals),
+                "max": max(vals),
+            }
+
+        out.append({
+            "room": room,
+            "action": action,
+            "n_samples": len(items),
+            "actual": s(actuals),
+            "expected": s(expecteds),
+            "diff": s(diffs),
+        })
+
+    # Sort: largest |median diff| first (most drifted), then by n desc.
+    out.sort(key=lambda x: (-abs(x["diff"].get("median", 0)), -x["n_samples"]))
+    return out
+
+
+def rolling_stats_summary(
+    conn: sqlite3.Connection,
+    n_samples: int = 100,
+    isolated_only: bool = True,
+) -> dict:
+    """Cross-room rolling stats over the last `n_samples` observations.
+    Useful as an "overall noise level" indicator: if delta_vs_expected
+    has median near 0 and stddev around 200-300W, calibration is
+    reasonably tight against the fridge/pump noise floor."""
+    import statistics as st
+    filter_iso = "AND n_actions = 1" if isolated_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT delta_load_w, expected_delta_w, delta_vs_expected_w
+        FROM observations
+        WHERE 1=1 {filter_iso}
+        ORDER BY ts_observed DESC
+        LIMIT ?
+        """,
+        (n_samples,),
+    ).fetchall()
+    if not rows:
+        return {"n": 0}
+    actuals = [int(r["delta_load_w"]) for r in rows]
+    diffs = [int(r["delta_vs_expected_w"]) for r in rows]
+
+    def s(vals: list[int]) -> dict:
+        return {
+            "n": len(vals),
+            "mean": round(st.mean(vals)),
+            "median": round(st.median(vals)),
+            "stddev": round(st.pstdev(vals)) if len(vals) > 1 else 0,
+            "min": min(vals),
+            "max": max(vals),
+        }
+
+    return {
+        "n": len(rows),
+        "isolated_only": isolated_only,
+        "actual": s(actuals),
+        "diff": s(diffs),
+    }
+
+
 def recent_observations(conn: sqlite3.Connection, n: int = 100) -> list[dict]:
     """Fetch the last N observation rows for display (web /observations)."""
     rows = conn.execute(
