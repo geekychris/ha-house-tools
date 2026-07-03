@@ -107,6 +107,99 @@ SAVINGS_MARKDOWN = (
     f"<sub>Valued at ${GRID_RATE_USD_PER_KWH:.2f}/kWh — avoided utility purchase (measured at the EPS off-grid output).</sub>"
 )
 
+PUMP_SLUG = os.environ.get("PUMP_SLUG", "esyminiv2_rhjl6")
+
+
+def _pump(kind: str, suffix: str) -> str:
+    return f"{kind}.{PUMP_SLUG}_{suffix}"
+
+
+PUMP_MARKDOWN = (
+    "### Water Pump\n"
+    f"Status: **{{{{ states('{_pump('sensor', 'pumpstatus')}') }}}}**  "
+    f"/ System: {{{{ states('{_pump('sensor', 'systemstatus')}') }}}}  "
+    f"/ Errors: {{{{ states('{_pump('sensor', 'faultpumpsnumber')}') }}}}\n\n"
+    f"Pressure: **{{{{ states('{_pump('sensor', 'vp_pressurepsi')}') }}}} psi**  "
+    f"(setpoint {{{{ states('{_pump('number', 'sp_setpointpressurepsi')}') }}}})  "
+    f"| Flow: **{{{{ states('{_pump('sensor', 'vf_flowgall')}') }}}} gal/min**  "
+    f"| Power: **{{{{ states('{_pump('sensor', 'po_outputpower')}') }}}} W**\n\n"
+    f"This month: **{{{{ states('{_pump('sensor', 'actual_period_flow_counter_gall')}') }}}} gal**, "
+    f"{{{{ states('{_pump('sensor', 'actual_period_energy_counter')}') }}}} kWh"
+    f"  &nbsp;|&nbsp;  Last month: {{{{ states('{_pump('sensor', 'last_period_flow_counter_gall')}') }}}} gal, "
+    f"{{{{ states('{_pump('sensor', 'last_period_energy_counter')}') }}}} kWh\n\n"
+    f"Sleep mode: {{{{ states('{_pump('switch', 'sleepmodeenable')}') }}}}"
+)
+
+
+def _pump_section() -> dict:
+    """Build the Water Pump grid section. Wrapped in a function so we can
+    return None cleanly if you want to conditionally disable it."""
+    return {
+        "type": "grid",
+        "cards": [
+            {"type": "heading", "heading": "Water Pump"},
+            {"type": "markdown", "content": PUMP_MARKDOWN},
+            # Live 24h chart: pressure + flow + power on one graph.
+            {
+                "type": "history-graph",
+                "hours_to_show": 24,
+                "refresh_interval": 60,
+                "title": "Last 24h",
+                "entities": [
+                    {"entity": _pump("sensor", "vp_pressurepsi"), "name": "Pressure (psi)"},
+                    {"entity": _pump("sensor", "vf_flowgall"), "name": "Flow (gal/min)"},
+                    {"entity": _pump("sensor", "po_outputpower"), "name": "Power (W)"},
+                ],
+            },
+            # Multi-day usage: statistics-graph for long-term daily totals.
+            # HA auto-collects long-term stats for sensors with proper
+            # state_class; DAB integration marks these as measurement/total.
+            {
+                "type": "statistics-graph",
+                "title": "Daily water usage (last 30 days)",
+                "chart_type": "bar",
+                "period": "day",
+                "days_to_show": 30,
+                "stat_types": ["change"],
+                "entities": [
+                    _pump("sensor", "fct_total_delivered_flow_gall"),
+                ],
+            },
+            {
+                "type": "statistics-graph",
+                "title": "Daily pump energy (last 30 days)",
+                "chart_type": "bar",
+                "period": "day",
+                "days_to_show": 30,
+                "stat_types": ["change"],
+                "entities": [
+                    _pump("sensor", "totalenergy"),
+                ],
+            },
+            # Quick controls: setpoint pressure + sleep mode toggle.
+            {
+                "type": "entities",
+                "show_header_toggle": False,
+                "entities": [
+                    {"entity": _pump("number", "sp_setpointpressurepsi"), "name": "Setpoint pressure (psi)"},
+                    {"entity": _pump("switch", "sleepmodeenable"), "name": "Sleep mode"},
+                    {"entity": _pump("select", "pumpdisable"), "name": "Enable / Disable"},
+                    {"entity": _pump("select", "powershowercommand"), "name": "Power Shower"},
+                    {"entity": _pump("button", "resetactualfault"), "name": "Clear faults"},
+                ],
+            },
+            {
+                "type": "markdown",
+                "content": (
+                    "<sub>For a per-day usage view with prev/next pagination, "
+                    "open <a href='http://pi-sf.hitorro.com:5010/water'>the "
+                    "pi-sf water page</a>.</sub>"
+                ),
+            },
+        ],
+    }
+
+
 _DEPTH = "sensor.water_depth_sensor_distance"
 WATER_MARKDOWN = (
     f"### Depth\n"
@@ -243,6 +336,13 @@ DASHBOARD_CONFIG = {
                         },
                     ],
                 },
+                # 1d) Water pump (DAB e.symini)
+                # Requires the HACS `hass-dabpumps` integration installed.
+                # Entity IDs use the pump's short slug (e.g. esyminiv2_rhjl6);
+                # if you swap hardware, update PUMP_SLUG below and re-run.
+                # For a browsable per-day usage view with pagination, see
+                # http://<pi-sf>:5010/water (served by smart_ac/web.py).
+                _pump_section(),
                 # 1d) AC toggles (Alexa-routines bridge -- input_booleans
                 # in this card are bridged to Alexa routines by the automations
                 # created in create_ac_toggle_automations.py)

@@ -158,6 +158,7 @@ def main() -> None:
         "create_telegram_smart_ac_report_command.py",
         "create_telegram_smart_ac_weekly_command.py",
         "create_telegram_override_command.py",
+        "create_telegram_pump_command.py",
         "create_telegram_battery_alert.py",
         "create_ac_toggle_automations.py",
         "create_smart_ac_nap_mode_automation.py",

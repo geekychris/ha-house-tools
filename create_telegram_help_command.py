@@ -76,6 +76,16 @@ AIR CONDITIONERS
               /override master for 2h           (pins current state)
               /override kyle clear
 
+WATER PUMP
+  /pump              - status snapshot
+  /pump on / off     - enable / disable (off STOPS water)
+  /pump boost        - Power Shower (turbo pressure)
+  /pump boost off    - stop Power Shower
+  /pump power [off]  - alias for boost
+  /pump sleep on/off - overnight energy-saver mode
+  /pump reset        - clear pump fault
+  Per-day usage with pagination: http://pi-sf.hitorro.com:5010/water
+
 MODES (toggle from the HA dashboard)
   input_boolean.smart_ac_party_mode - looser comfort, always run
     living + dining (75F target).

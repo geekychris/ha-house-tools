@@ -44,6 +44,14 @@ SCHEDULER_STATE = pathlib.Path("/home/chris/smart_ac_state.json")
 
 PORT = 5010
 
+# DAB pump entity slug. See create_telegram_pump_command.py for how to find
+# yours; override via PUMP_SLUG env at systemd EnvironmentFile.
+PUMP_SLUG = os.environ.get("PUMP_SLUG", "esyminiv2_rhjl6")
+
+
+def _pump_e(kind: str, suffix: str) -> str:
+    return f"{kind}.{PUMP_SLUG}_{suffix}"
+
 # ---------------------------------------------------------------------- config
 
 
@@ -164,6 +172,7 @@ def page(title: str, body: str, refresh_sec: int | None = None) -> bytes:
   <a href="/decisions">Decisions</a>
   <a href="/overrides">Overrides</a>
   <a href="/calibrate">Calibrate</a>
+  <a href="/water">Water</a>
   <a href="/status.json">JSON</a>
 </header>
 <main>
@@ -565,6 +574,258 @@ function clearOverride(room) {{
     return page("Overrides", body, refresh_sec=60)
 
 
+def _ha_history(entity_id: str, start_iso: str, end_iso: str) -> list[dict]:
+    """Fetch HA history for one entity across [start, end).
+    Returns a list of {last_changed, state} dicts, or [] on error."""
+    path = (
+        f"/api/history/period/{urllib.parse.quote(start_iso)}"
+        f"?filter_entity_id={entity_id}"
+        f"&end_time={urllib.parse.quote(end_iso)}"
+    )
+    data = ha_get(path)
+    if not data or not isinstance(data, list) or not data:
+        return []
+    # HA history returns a list per entity id; we asked for one.
+    series = data[0] if data else []
+    out: list[dict] = []
+    for pt in series:
+        try:
+            val = float(pt["state"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        out.append({"t": pt["last_changed"], "v": val})
+    return out
+
+
+def _svg_line_chart(series: list[tuple[str, list[dict], str]], title: str,
+                    width: int = 800, height: int = 240) -> str:
+    """Render one or more time-series as an SVG line chart.
+    series: list of (label, points, color) where points is list of
+    {"t": iso, "v": float}.
+
+    All series share the same X axis (time span). Each has its own Y
+    autoscale, drawn as a light line + label."""
+    pad_l, pad_r, pad_t, pad_b = 50, 20, 30, 30
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    # Compute time span across all series
+    all_times: list[dt.datetime] = []
+    for _, pts, _ in series:
+        for p in pts:
+            try:
+                all_times.append(dt.datetime.fromisoformat(p["t"].replace("Z", "+00:00")))
+            except Exception:
+                pass
+    if not all_times:
+        return f'<div class="card"><h3>{html.escape(title)}</h3><p class="subtle">(no data)</p></div>'
+    t_min, t_max = min(all_times), max(all_times)
+    span_s = max((t_max - t_min).total_seconds(), 1)
+
+    def x_for(ts: dt.datetime) -> float:
+        return pad_l + plot_w * ((ts - t_min).total_seconds() / span_s)
+
+    parts: list[str] = [
+        f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+        f'style="width:100%;max-width:{width}px">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#171a22"/>',
+    ]
+
+    # Draw each series
+    legend_x = pad_l
+    for idx, (label, pts, color) in enumerate(series):
+        if not pts:
+            continue
+        vals = [p["v"] for p in pts]
+        v_min, v_max = min(vals), max(vals)
+        v_min = min(v_min, 0.0)
+        if v_max - v_min < 1e-6:
+            v_max = v_min + 1.0
+
+        def y_for(v: float, vmin=v_min, vmax=v_max) -> float:
+            return pad_t + plot_h - plot_h * ((v - vmin) / (vmax - vmin))
+
+        path_pts: list[str] = []
+        for p in pts:
+            try:
+                ts = dt.datetime.fromisoformat(p["t"].replace("Z", "+00:00"))
+            except Exception:
+                continue
+            path_pts.append(f"{x_for(ts):.1f},{y_for(p['v']):.1f}")
+        if path_pts:
+            parts.append(
+                f'<polyline fill="none" stroke="{color}" stroke-width="1.5" '
+                f'points="{" ".join(path_pts)}"/>'
+            )
+        # Legend entry (top-left)
+        parts.append(
+            f'<circle cx="{legend_x + 6}" cy="16" r="4" fill="{color}"/>'
+            f'<text x="{legend_x + 14}" y="20" fill="#dde3ec" font-size="12">'
+            f'{html.escape(label)} (max {v_max:.1f})</text>'
+        )
+        legend_x += 180
+
+    # X axis: 4 hourly labels
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        x = pad_l + plot_w * frac
+        t = t_min + dt.timedelta(seconds=span_s * frac)
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{pad_t + plot_h}" x2="{x:.1f}" '
+            f'y2="{pad_t + plot_h + 4}" stroke="#8592a8"/>'
+            f'<text x="{x:.1f}" y="{pad_t + plot_h + 18}" fill="#8592a8" '
+            f'font-size="11" text-anchor="middle">{t.strftime("%H:%M")}</text>'
+        )
+    # Chart baseline
+    parts.append(
+        f'<line x1="{pad_l}" y1="{pad_t + plot_h}" x2="{pad_l + plot_w}" '
+        f'y2="{pad_t + plot_h}" stroke="#23283a"/>'
+    )
+    parts.append("</svg>")
+    return (
+        f'<div class="card"><h3>{html.escape(title)}</h3>'
+        + "".join(parts) + "</div>"
+    )
+
+
+def _svg_bar_chart(labels: list[str], values: list[float], title: str,
+                   width: int = 800, height: int = 220, unit: str = "") -> str:
+    """Render a vertical bar chart for multi-day totals."""
+    if not values:
+        return f'<div class="card"><h3>{html.escape(title)}</h3><p class="subtle">(no data)</p></div>'
+    pad_l, pad_r, pad_t, pad_b = 50, 20, 20, 40
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+    v_max = max(values) or 1.0
+    bar_w = plot_w / max(len(values), 1)
+
+    parts: list[str] = [
+        f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+        f'style="width:100%;max-width:{width}px">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#171a22"/>',
+    ]
+    for i, (lab, v) in enumerate(zip(labels, values)):
+        h = plot_h * (v / v_max)
+        x = pad_l + i * bar_w + 4
+        y = pad_t + plot_h - h
+        parts.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w - 8:.1f}" '
+            f'height="{h:.1f}" fill="#56a0ff"/>'
+        )
+        # value label
+        parts.append(
+            f'<text x="{x + (bar_w - 8) / 2:.1f}" y="{y - 4:.1f}" fill="#dde3ec" '
+            f'font-size="11" text-anchor="middle">{v:.0f}</text>'
+        )
+        # x label
+        parts.append(
+            f'<text x="{x + (bar_w - 8) / 2:.1f}" y="{pad_t + plot_h + 16:.1f}" '
+            f'fill="#8592a8" font-size="11" text-anchor="middle">'
+            f'{html.escape(lab)}</text>'
+        )
+    parts.append(
+        f'<text x="{pad_l - 8}" y="{pad_t + 12}" fill="#8592a8" '
+        f'font-size="11" text-anchor="end">{v_max:.0f}{unit}</text>'
+    )
+    parts.append("</svg>")
+    return (
+        f'<div class="card"><h3>{html.escape(title)}</h3>'
+        + "".join(parts) + "</div>"
+    )
+
+
+def view_water(query_params: dict) -> bytes:
+    """Per-day water pump view with prev/next pagination."""
+    today = dt.date.today()
+    try:
+        date_str = query_params.get("date", [today.isoformat()])[0]
+        day = dt.date.fromisoformat(date_str)
+    except Exception:
+        day = today
+    prev_day = day - dt.timedelta(days=1)
+    next_day = day + dt.timedelta(days=1)
+    is_today = (day == today)
+
+    # Local-day boundaries
+    start = dt.datetime.combine(day, dt.time.min).astimezone()
+    end = dt.datetime.combine(day, dt.time.max).astimezone()
+
+    pressure = _ha_history(_pump_e("sensor", "vp_pressurepsi"),
+                           start.isoformat(), end.isoformat())
+    flow = _ha_history(_pump_e("sensor", "vf_flowgall"),
+                       start.isoformat(), end.isoformat())
+    power = _ha_history(_pump_e("sensor", "po_outputpower"),
+                        start.isoformat(), end.isoformat())
+
+    # Live current stats
+    stat_map = {
+        "Status": ha_get(f"/api/states/{_pump_e('sensor', 'pumpstatus')}"),
+        "System": ha_get(f"/api/states/{_pump_e('sensor', 'systemstatus')}"),
+        "Errors": ha_get(f"/api/states/{_pump_e('sensor', 'faultpumpsnumber')}"),
+    }
+    stat_rows = "".join(
+        f'<tr><td>{k}</td><td>{s["state"] if s else "?"}</td></tr>'
+        for k, s in stat_map.items()
+    )
+
+    # 7-day usage bar chart. Compute daily totals from
+    # actual_period_flow_counter_gall's history: since it's monthly-reset,
+    # simpler to sum flow rate. But rate is instantaneous, not integrated.
+    # As a shortcut: fetch fct_total_delivered_flow_gall (cumulative) daily.
+    labels: list[str] = []
+    daily_flow: list[float] = []
+    daily_kwh: list[float] = []
+    for offset in range(6, -1, -1):
+        d = today - dt.timedelta(days=offset)
+        d_start = dt.datetime.combine(d, dt.time.min).astimezone()
+        d_end = dt.datetime.combine(d, dt.time.max).astimezone()
+        flow_hist = _ha_history(_pump_e("sensor", "fct_total_delivered_flow_gall"),
+                                d_start.isoformat(), d_end.isoformat())
+        kwh_hist = _ha_history(_pump_e("sensor", "totalenergy"),
+                               d_start.isoformat(), d_end.isoformat())
+        if flow_hist:
+            daily_flow.append(max(0.0, flow_hist[-1]["v"] - flow_hist[0]["v"]))
+        else:
+            daily_flow.append(0.0)
+        if kwh_hist:
+            daily_kwh.append(max(0.0, kwh_hist[-1]["v"] - kwh_hist[0]["v"]))
+        else:
+            daily_kwh.append(0.0)
+        labels.append(d.strftime("%a"))
+
+    charts = ""
+    charts += _svg_line_chart(
+        [("Pressure (psi)", pressure, "#7ce38b")],
+        f"Pressure — {day.isoformat()}",
+    )
+    charts += _svg_line_chart(
+        [("Flow (gal/min)", flow, "#56a0ff"),
+         ("Power (W)", power, "#ffb454")],
+        f"Flow + Power — {day.isoformat()}",
+    )
+
+    nav = (
+        f'<a href="/water?date={prev_day.isoformat()}">◀ {prev_day.isoformat()}</a>'
+        f'&nbsp;&nbsp; <strong>{day.isoformat()}{" (today)" if is_today else ""}</strong>'
+        f'&nbsp;&nbsp; '
+        + (f'<a href="/water?date={next_day.isoformat()}">{next_day.isoformat()} ▶</a>'
+           if not is_today else '<span class="subtle">tomorrow</span>')
+        + f'&nbsp;&nbsp; <a href="/water">jump to today</a>'
+    )
+
+    body = f"""
+<div class="card">
+  <h1>Water pump — {day.isoformat()}</h1>
+  <p>{nav}</p>
+  <table><tr><th>Live</th><th></th></tr>{stat_rows}</table>
+</div>
+{charts}
+{_svg_bar_chart(labels, daily_flow, "Daily flow (gal) — last 7 days", unit=" gal")}
+{_svg_bar_chart(labels, daily_kwh, "Daily energy (kWh) — last 7 days", unit=" kWh")}
+"""
+    return page(f"Water {day.isoformat()}", body,
+                refresh_sec=60 if is_today else None)
+
+
 def view_status_json() -> bytes:
     s = ha_get(f"/api/states/{CFG['status_sensor_entity']}")
     retro = ha_get("/api/states/sensor.smart_ac_retrospective")
@@ -753,6 +1014,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._respond(200, view_calibrate())
             elif path == "/overrides":
                 self._respond(200, view_overrides())
+            elif path == "/water":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._respond(200, view_water(query))
             elif path == "/status.json":
                 self._respond(200, view_status_json(), content_type="application/json")
             elif path == "/healthz":
