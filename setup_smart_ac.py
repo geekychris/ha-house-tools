@@ -126,6 +126,7 @@ def main() -> None:
         "web.py",
         "smart-ac-web.service",
         "stats.py",
+        "analyze.py",
     )
     for fname in source_files:
         src = SRC_DIR / fname

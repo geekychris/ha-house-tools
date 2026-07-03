@@ -722,6 +722,19 @@ def main() -> int:
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         },
     )
+
+    # Materialise the day's summary into the stats DB. weekly.py + any
+    # downstream tool that wants "give me the last N days rolled up"
+    # queries this table instead of parsing markdown / JSON files.
+    if _stats is not None:
+        try:
+            with _stats.opened() as conn:
+                _stats.insert_daily_summary(
+                    conn, day_stem, summary,
+                    observations_summary=daily_obs_summary,
+                )
+        except Exception as e:
+            print(f"# insert_daily_summary failed: {e}", file=sys.stderr)
     return 0
 
 

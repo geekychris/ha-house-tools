@@ -93,6 +93,29 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS idx_obs_ts_observed ON observations(ts_observed);
 CREATE INDEX IF NOT EXISTS idx_obs_room_action ON observations(primary_room, primary_action);
 CREATE INDEX IF NOT EXISTS idx_obs_mode ON observations(mode_at_action);
+
+-- Materialised daily summary. Written by retrospective.py at end of each
+-- day's run. weekly.py queries this instead of parsing per-day JSON
+-- sidecars (faster, and no filesystem walk).
+CREATE TABLE IF NOT EXISTS daily_summaries (
+    day TEXT NOT NULL PRIMARY KEY,      -- YYYY-MM-DD (local)
+    generated_at TEXT NOT NULL,
+    soc_start REAL,
+    soc_peak REAL,
+    soc_end REAL,
+    total_ac_min INTEGER,               -- sum across all rooms
+    total_kwh REAL,
+    total_usd REAL,
+    per_room_min_json TEXT,             -- {"master": 480, ...}
+    per_room_cost_json TEXT,            -- {"master": {"kwh":4.2,"usd":1.26}, ...}
+    modes_min_json TEXT,                -- {"NIGHT":480, "ON_TRACK":120, ...}
+    turn_off_savings_w INTEGER,         -- sum of |delta_load_w| over turn_offs (from observations)
+    turn_on_load_w INTEGER,             -- sum of delta_load_w over turn_ons
+    n_actions INTEGER,
+    decision_count INTEGER,
+    raw_json TEXT                       -- full retrospective summary blob
+);
+CREATE INDEX IF NOT EXISTS idx_daily_day ON daily_summaries(day);
 """
 
 
@@ -387,6 +410,254 @@ def warm_up_rates(
         }
         for r in rows
     ]
+
+
+def insert_daily_summary(
+    conn: sqlite3.Connection, day: str, summary: dict, observations_summary: dict | None = None,
+) -> None:
+    """Idempotent write of one day's rollup. `day` is 'YYYY-MM-DD' (local).
+    Existing rows for the same day are replaced (retrospective can be re-run)."""
+    soc = summary.get("soc") or {}
+    runtime = summary.get("runtime_min") or {}
+    costs = summary.get("costs") or {}
+    modes = summary.get("modes_min") or {}
+    obs = observations_summary or (summary.get("observations") or {})
+
+    per_room_cost = {
+        r: {"kwh": c.get("kwh", 0), "usd": c.get("usd", 0)}
+        for r, c in costs.items() if r != "_total" and isinstance(c, dict)
+    }
+    total_kwh = float((costs.get("_total") or {}).get("kwh") or 0)
+    total_usd = float((costs.get("_total") or {}).get("usd") or 0)
+    total_ac_min = int(sum(runtime.values()))
+    off = (obs or {}).get("turn_off") or {}
+    on = (obs or {}).get("turn_on") or {}
+
+    conn.execute(
+        "INSERT OR REPLACE INTO daily_summaries ("
+        "day, generated_at, soc_start, soc_peak, soc_end, "
+        "total_ac_min, total_kwh, total_usd, "
+        "per_room_min_json, per_room_cost_json, modes_min_json, "
+        "turn_off_savings_w, turn_on_load_w, n_actions, decision_count, raw_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            day,
+            dt.datetime.utcnow().isoformat(),
+            soc.get("start"),
+            soc.get("peak"),
+            soc.get("end"),
+            total_ac_min,
+            total_kwh,
+            total_usd,
+            json.dumps(runtime),
+            json.dumps(per_room_cost),
+            json.dumps(modes),
+            int(off.get("total_saved_w") or 0),
+            int(on.get("total_added_w") or 0),
+            len(summary.get("actions") or []),
+            int(summary.get("decision_count") or 0),
+            json.dumps(summary, default=str),
+        ),
+    )
+    conn.commit()
+
+
+def get_daily_summaries(
+    conn: sqlite3.Connection, days_back: int = 7,
+) -> list[dict]:
+    """Return the last `days_back` daily_summaries rows, oldest first.
+    Empty list if none. weekly.py's primary data source."""
+    rows = conn.execute(
+        "SELECT * FROM daily_summaries "
+        "WHERE day >= date('now', ?) "
+        "ORDER BY day ASC",
+        (f"-{days_back} days",),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def weekly_from_db(
+    conn: sqlite3.Connection, days_back: int = 7,
+) -> dict:
+    """Aggregate the last N days of daily_summaries into a weekly report.
+    Same shape as weekly.py's aggregate() so downstream code can consume
+    either path. Returns {} if no daily rows found."""
+    rows = get_daily_summaries(conn, days_back)
+    if not rows:
+        return {"n_days_with_data": 0}
+    modes_min: dict[str, int] = {}
+    runtime_min: dict[str, int] = {}
+    cost_kwh: dict[str, float] = {}
+    cost_usd: dict[str, float] = {}
+    total_kwh = 0.0
+    total_usd = 0.0
+    soc_starts: list[float] = []
+    soc_ends: list[float] = []
+    soc_peaks: list[float] = []
+    per_day: list[dict] = []
+
+    for r in rows:
+        modes = json.loads(r["modes_min_json"] or "{}")
+        for m, mins in modes.items():
+            modes_min[m] = modes_min.get(m, 0) + int(mins)
+        prm = json.loads(r["per_room_min_json"] or "{}")
+        for room, mins in prm.items():
+            runtime_min[room] = runtime_min.get(room, 0) + int(mins)
+        prc = json.loads(r["per_room_cost_json"] or "{}")
+        for room, cost in prc.items():
+            cost_kwh[room] = cost_kwh.get(room, 0.0) + float(cost.get("kwh") or 0)
+            cost_usd[room] = cost_usd.get(room, 0.0) + float(cost.get("usd") or 0)
+        total_kwh += float(r["total_kwh"] or 0)
+        total_usd += float(r["total_usd"] or 0)
+        if r["soc_start"] is not None:
+            soc_starts.append(float(r["soc_start"]))
+        if r["soc_end"] is not None:
+            soc_ends.append(float(r["soc_end"]))
+        if r["soc_peak"] is not None:
+            soc_peaks.append(float(r["soc_peak"]))
+        per_day.append({
+            "day": r["day"],
+            "soc_start": r["soc_start"],
+            "soc_end": r["soc_end"],
+            "soc_peak": r["soc_peak"],
+            "ac_total_min": r["total_ac_min"],
+            "kwh": r["total_kwh"],
+            "usd": r["total_usd"],
+        })
+
+    return {
+        "n_days_with_data": len(rows),
+        "modes_min": modes_min,
+        "runtime_min": runtime_min,
+        "cost_kwh": {k: round(v, 2) for k, v in cost_kwh.items()},
+        "cost_usd": {k: round(v, 2) for k, v in cost_usd.items()},
+        "total_kwh": round(total_kwh, 2),
+        "total_usd": round(total_usd, 2),
+        "soc_min": min(soc_ends + soc_starts) if (soc_ends or soc_starts) else None,
+        "soc_max": max(soc_peaks) if soc_peaks else None,
+        "soc_avg_start": round(sum(soc_starts) / len(soc_starts), 1) if soc_starts else None,
+        "soc_avg_end": round(sum(soc_ends) / len(soc_ends), 1) if soc_ends else None,
+        "per_day": per_day,
+    }
+
+
+# ---------------------------------------------------------------- correlations
+
+
+def mode_minutes_last_days(
+    conn: sqlite3.Connection, days_back: int = 30,
+) -> dict[str, float]:
+    """Total minutes in each mode over the last N days, computed from the
+    decisions table (one row per tick). Cross-checks the daily_summaries
+    aggregate."""
+    rows = conn.execute(
+        "SELECT mode, COUNT(*) AS ticks FROM decisions "
+        "WHERE ts_local >= datetime('now', ?) "
+        "GROUP BY mode",
+        (f"-{days_back} days",),
+    ).fetchall()
+    # Each tick = evaluation_interval_minutes worth of time. Caller can
+    # scale by their interval; default assumption 5 min/tick.
+    return {r["mode"]: int(r["ticks"]) * 5 for r in rows}
+
+
+def outdoor_temp_vs_warmup(
+    conn: sqlite3.Connection, room: str, days_back: int = 60,
+) -> list[dict]:
+    """Return {outdoor_f, warmup_f_per_min} pairs for one room's isolated
+    turn_off observations. Feed into a scatter plot."""
+    rows = conn.execute(
+        "SELECT before_outdoor_f AS outdoor, "
+        "  delta_indoor_f_room / age_min AS f_per_min "
+        "FROM observations "
+        "WHERE primary_room = ? AND primary_action = 'turn_off' "
+        "  AND n_actions = 1 AND delta_indoor_f_room IS NOT NULL "
+        "  AND delta_indoor_f_room > 0 AND age_min BETWEEN 3 AND 15 "
+        "  AND ts_observed >= datetime('now', ?) "
+        "ORDER BY outdoor",
+        (room, f"-{days_back} days"),
+    ).fetchall()
+    return [
+        {"outdoor_f": float(r["outdoor"]), "warmup_f_per_min": round(float(r["f_per_min"]), 3)}
+        for r in rows if r["outdoor"] is not None
+    ]
+
+
+def cost_by_day(
+    conn: sqlite3.Connection, days_back: int = 30,
+) -> list[dict]:
+    """Daily cost trend from daily_summaries. Sorted oldest first."""
+    rows = conn.execute(
+        "SELECT day, total_kwh, total_usd FROM daily_summaries "
+        "WHERE day >= date('now', ?) "
+        "ORDER BY day ASC",
+        (f"-{days_back} days",),
+    ).fetchall()
+    return [
+        {"day": r["day"], "kwh": float(r["total_kwh"] or 0), "usd": float(r["total_usd"] or 0)}
+        for r in rows
+    ]
+
+
+def net_savings_by_day(
+    conn: sqlite3.Connection, days_back: int = 30,
+) -> list[dict]:
+    """From daily_summaries, per-day: turn_off_savings_w (sum), turn_on_load_w,
+    net = turn_off - turn_on (positive = net conservation)."""
+    rows = conn.execute(
+        "SELECT day, turn_off_savings_w AS off_w, turn_on_load_w AS on_w "
+        "FROM daily_summaries WHERE day >= date('now', ?) "
+        "ORDER BY day ASC",
+        (f"-{days_back} days",),
+    ).fetchall()
+    out = []
+    for r in rows:
+        off_w = int(r["off_w"] or 0)
+        on_w = int(r["on_w"] or 0)
+        out.append({
+            "day": r["day"],
+            "turn_off_savings_w": off_w,
+            "turn_on_load_w": on_w,
+            "net_conserved_w": off_w - on_w,
+        })
+    return out
+
+
+# ---------------------------------------------------------------- retention
+
+
+def prune(
+    conn: sqlite3.Connection,
+    decisions_days: int = 90,
+    observations_days: int | None = None,
+    daily_summaries_days: int | None = None,
+) -> dict[str, int]:
+    """Delete rows older than the given retention. Set to None to keep forever.
+    Returns count deleted per table. Runs VACUUM after to reclaim space
+    (SQLite doesn't shrink files after DELETEs by itself)."""
+    deleted: dict[str, int] = {}
+    if decisions_days is not None:
+        cur = conn.execute(
+            "DELETE FROM decisions WHERE ts_local < datetime('now', ?)",
+            (f"-{decisions_days} days",),
+        )
+        deleted["decisions"] = cur.rowcount
+    if observations_days is not None:
+        cur = conn.execute(
+            "DELETE FROM observations WHERE ts_observed < datetime('now', ?)",
+            (f"-{observations_days} days",),
+        )
+        deleted["observations"] = cur.rowcount
+    if daily_summaries_days is not None:
+        cur = conn.execute(
+            "DELETE FROM daily_summaries WHERE day < date('now', ?)",
+            (f"-{daily_summaries_days} days",),
+        )
+        deleted["daily_summaries"] = cur.rowcount
+    conn.commit()
+    if any(deleted.values()):
+        conn.execute("VACUUM")
+    return deleted
 
 
 def recent_observations(conn: sqlite3.Connection, n: int = 100) -> list[dict]:

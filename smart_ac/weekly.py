@@ -207,8 +207,38 @@ def main() -> int:
     n_days = int(sys.argv[1]) if len(sys.argv) > 1 else 7
     now = dt.datetime.now().astimezone()
 
-    days, missing = load_days(n_days)
-    agg = aggregate(days)
+    # Prefer the SQLite daily_summaries table if it has enough data. Fall
+    # back to parsing per-day JSON sidecars when the DB is empty (fresh
+    # install) or partial.
+    try:
+        from . import stats as _stats  # type: ignore
+    except (ImportError, ValueError):
+        try:
+            import stats as _stats  # type: ignore
+        except ImportError:
+            _stats = None  # type: ignore
+
+    agg: dict = {}
+    missing: list[str] = []
+    used_db = False
+    if _stats is not None:
+        try:
+            with _stats.opened() as conn:
+                db_agg = _stats.weekly_from_db(conn, days_back=n_days)
+                if db_agg.get("n_days_with_data", 0) >= 1:
+                    agg = db_agg
+                    used_db = True
+        except Exception as e:
+            print(f"# stats DB read failed, falling back to JSON: {e}", file=sys.stderr)
+
+    if not used_db:
+        days, missing = load_days(n_days)
+        agg = aggregate(days)
+        print("# aggregated from per-day JSON sidecars (DB was empty)", file=sys.stderr)
+    else:
+        print(f"# aggregated {agg['n_days_with_data']} days from daily_summaries table",
+              file=sys.stderr)
+
     report = make_report(agg, missing, now)
 
     stem = now.strftime("weekly-%Y-W%V")
@@ -254,6 +284,24 @@ def main() -> int:
         print("# updated sensor.smart_ac_weekly", file=sys.stderr)
     except Exception as e:
         print(f"# HA push failed: {e}", file=sys.stderr)
+
+    # Prune the stats DB. Weekly cadence gives us a natural cleanup
+    # opportunity. Env-overridable retention: default keep 90 days of
+    # decisions (~26k rows) and observations + daily_summaries forever.
+    if _stats is not None:
+        try:
+            keep_dec = int(os.environ.get("STATS_PRUNE_DECISIONS_DAYS", "90"))
+            with _stats.opened() as conn:
+                deleted = _stats.prune(
+                    conn,
+                    decisions_days=keep_dec,
+                    observations_days=None,
+                    daily_summaries_days=None,
+                )
+                if any(deleted.values()):
+                    print(f"# pruned {deleted}", file=sys.stderr)
+        except Exception as e:
+            print(f"# prune failed: {e}", file=sys.stderr)
     return 0
 
 

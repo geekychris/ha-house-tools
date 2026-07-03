@@ -70,6 +70,71 @@ def test_insert_and_query_observation(tmp_path: pathlib.Path):
         assert summary["turn_off"]["total_saved_w"] == 1200
 
 
+def test_daily_summary_insert_and_weekly_from_db(tmp_path: pathlib.Path):
+    with stats.opened(tmp_path / "stats.sqlite3") as conn:
+        summary = {
+            "soc": {"start": 60, "peak": 100, "end": 55},
+            "modes_min": {"NIGHT": 300, "SURPLUS": 240},
+            "runtime_min": {"master": 300, "living": 240},
+            "costs": {
+                "master": {"kwh": 4.2, "usd": 1.26, "watts_used": 1380,
+                           "watts_source": "measured"},
+                "living": {"kwh": 3.6, "usd": 1.08, "watts_used": 1252,
+                           "watts_source": "measured"},
+                "_total": {"kwh": 7.8, "usd": 2.34, "rate_usd_per_kwh": 0.30},
+            },
+            "actions": [{"room": "living", "action": "turn_off",
+                         "reason": "x", "mode": "DEFICIT", "ts": "2026-07-01"}],
+            "decision_count": 288,
+            "observations": {
+                "turn_off": {"n": 1, "total_saved_w": 1200, "avg_saved_w": 1200},
+                "turn_on": {"n": 0, "total_added_w": 0, "avg_added_w": 0},
+            },
+        }
+        stats.insert_daily_summary(conn, "2026-07-01", summary,
+                                    observations_summary=summary["observations"])
+        # Second insert (retrospective re-run) replaces
+        stats.insert_daily_summary(conn, "2026-07-01", summary,
+                                    observations_summary=summary["observations"])
+        n = conn.execute("SELECT COUNT(*) FROM daily_summaries").fetchone()[0]
+        assert n == 1
+
+        agg = stats.weekly_from_db(conn, days_back=30)
+        assert agg["n_days_with_data"] == 1
+        assert agg["total_kwh"] == 7.8
+        assert agg["cost_usd"]["master"] == 1.26
+
+
+def test_prune(tmp_path: pathlib.Path):
+    with stats.opened(tmp_path / "stats.sqlite3") as conn:
+        # Insert one old + one recent decision.
+        conn.execute(
+            "INSERT INTO decisions ("
+            "ts, ts_local, mode, soc, battery_power_w, pv_power_w, load_w, "
+            "outdoor_f, indoor_f_json, ac_on_json, target_json, reasons_json, "
+            "actions_json, enabled, unoccupied, raw_json) VALUES ("
+            "?, ?, 'NIGHT', 80, 0, 0, 1000, 70, '{}', '{}', '{}', '{}', '[]', 1, 0, '{}')",
+            ("2025-01-01T00:00:00+00:00", "2025-01-01T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO decisions ("
+            "ts, ts_local, mode, soc, battery_power_w, pv_power_w, load_w, "
+            "outdoor_f, indoor_f_json, ac_on_json, target_json, reasons_json, "
+            "actions_json, enabled, unoccupied, raw_json) VALUES ("
+            "?, ?, 'NIGHT', 80, 0, 0, 1000, 70, '{}', '{}', '{}', '{}', '[]', 1, 0, '{}')",
+            ("2026-07-03T00:00:00+00:00", "2026-07-03T00:00:00"),
+        )
+        conn.commit()
+        n_before = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+        assert n_before == 2
+
+        deleted = stats.prune(conn, decisions_days=90)
+        # Old row should be gone; recent should remain.
+        n_after = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+        assert deleted["decisions"] == 1
+        assert n_after == 1
+
+
 def test_backfill_from_jsonl(tmp_path: pathlib.Path):
     dpath = tmp_path / "decisions.log"
     opath = tmp_path / "observations.jsonl"
