@@ -189,6 +189,42 @@ class Snapshot:
         self.nap_mode = states.get("input_boolean.smart_ac_nap_mode", {}).get("state") == "on"
         self.vacation_mode = states.get("input_boolean.smart_ac_vacation_mode", {}).get("state") == "on"
 
+        # Charge boost: user says "for the next N hours, favor charging over
+        # comfort." Backed by input_datetime.smart_ac_charge_boost_until;
+        # any future value = active. Set via /charge_boost Telegram command
+        # or the setup_smart_ac_charge_boost.py helper. When active, the
+        # scheduler drops to day_min_acs only (no extras) regardless of
+        # DAY sub-mode, and prepends "CHARGE_BOOST" to the mode label.
+        self.charge_boost_until: dt.datetime | None = None
+        cb_state = states.get(
+            "input_datetime.smart_ac_charge_boost_until", {}
+        ).get("state")
+        if cb_state and cb_state not in ("unknown", "unavailable"):
+            try:
+                naive = dt.datetime.strptime(cb_state, "%Y-%m-%d %H:%M:%S")
+                self.charge_boost_until = naive.astimezone()
+            except Exception:
+                pass
+        self.charge_boost = (
+            self.charge_boost_until is not None
+            and self.now < self.charge_boost_until
+        )
+
+        # Weather signals for decision annotation. All optional -- if the
+        # weather integration isn't installed the reason strings just skip
+        # the annotation. Values come from openmeteo.py.
+        def _fnum(eid: str) -> float | None:
+            v = states.get(eid, {}).get("state")
+            if not v or v in ("unknown", "unavailable"):
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        self.weather_cloud_now = _fnum("sensor.weather_cloud_now")
+        self.weather_expected_pv_w = _fnum("sensor.weather_expected_pv_now")
+        self.weather_tomorrow_pv_kwh = _fnum("sensor.weather_tomorrow_pv_kwh")
+
         # AC current states + when each last changed
         all_rooms = sorted(set(cfg["night_min_acs"]) | set(cfg["day_priority"]))
         self.ac_on: dict[str, bool] = {}
@@ -281,6 +317,24 @@ def room_needs_cooling(
     return snap.outdoor_f > outdoor_hot_threshold_f
 
 
+def _weather_note(snap: Snapshot) -> str | None:
+    """Return a short annotation about weather impact on PV, or None if
+    nothing notable. Read from openmeteo.py-published sensors:
+      - sensor.weather_cloud_now   (percent)
+      - sensor.weather_tomorrow_pv_kwh
+    Skips silently if either is absent."""
+    parts: list[str] = []
+    cloud = getattr(snap, "weather_cloud_now", None)
+    if cloud is not None and cloud >= 60:
+        parts.append(f"cloudy {int(cloud)}%")
+    tmw = getattr(snap, "weather_tomorrow_pv_kwh", None)
+    if tmw is not None and tmw < 30:
+        parts.append(f"low-forecast tmw {int(tmw)}kWh")
+    if not parts:
+        return None
+    return "weather: " + ", ".join(parts)
+
+
 def effective_params(snap: Snapshot, cfg: dict) -> dict:
     """Returns the in-effect knobs for this tick.
 
@@ -349,8 +403,15 @@ def effective_params(snap: Snapshot, cfg: dict) -> dict:
             "mode_label": "PARTY",
         }
     night_min = list(cfg["night_min_acs"])
+    # day_min_acs: which ACs are forced ON during the DAY period. Defaults
+    # to night_min_acs so existing configs keep their behaviour. Set to a
+    # different list (or []) to have a separate day-time baseline -- lets
+    # you say "at night keep master+kyle+guest, but during the day let
+    # the scheduler decide who runs based on day_priority alone."
+    day_min = list(cfg.get("day_min_acs", night_min))
     return {
         "night_min": night_min,
+        "day_min": day_min,
         # evening_min falls back to night_min if not explicitly configured, so
         # existing setups keep their behaviour. Explicit evening_min lets you
         # run FEWER bedrooms during the "family up but sun gone" window.
@@ -398,12 +459,16 @@ def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
     max_total = eff["max_total"]
     occ_label = eff["mode_label"]
     evening_extras = eff["evening_extras"]
+    # day_min may differ from night_min (see effective_params). If not set
+    # in cfg it falls back to night_min so nothing changes for existing
+    # configs.
+    day_min = eff.get("day_min", night_min)
 
     # Universe = ALL rooms we might toggle (config defaults to occupied set so
     # we never lose track of an AC even in unoccupied mode).
     all_rooms = sorted(
         set(cfg["night_min_acs"]) | set(cfg["day_priority"])
-        | set(night_min) | set(priority)
+        | set(night_min) | set(day_min) | set(priority)
     )
 
     morning = dt.timedelta(minutes=cfg["sun_offset_morning_min"])
@@ -440,11 +505,11 @@ def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
         for r in priority:
             reasons[r] = "skipped (NIGHT: after bedtime / before sunrise)"
     elif mode == "DEFICIT":
-        target = set(night_min)
+        target = set(day_min)
         for r in priority:
             reasons[r] = "skipped (DEFICIT: battery is discharging during the day)"
     elif mode == "CHARGE_BEHIND":
-        target = set(night_min)
+        target = set(day_min)
         for r in priority:
             reasons[r] = "skipped (CHARGE_BEHIND: won't reach SoC target by sunset)"
     elif mode == "EVENING":
@@ -468,11 +533,11 @@ def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
                 continue
             reasons[r] = "skipped (EVENING: past solar day, not in evening_extra_required)"
     elif mode == "ON_TRACK":
-        target = set(night_min)
+        target = set(day_min)
         for r in priority:
             if r in target:
                 continue
-            if needs(r) and len(target) < len(night_min) + 1:
+            if needs(r) and len(target) < len(day_min) + 1:
                 target.add(r)
                 reasons[r] = "added (ON_TRACK: 1-extra slot, room needs cooling)"
             else:
@@ -482,7 +547,7 @@ def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
                     else "skipped (ON_TRACK: 1-extra slot already taken)"
                 )
     else:  # SURPLUS
-        target = set(night_min)
+        target = set(day_min)
         for r in priority:
             if needs(r):
                 target.add(r)
@@ -505,14 +570,43 @@ def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
                 reasons[r] = f"skipped (unoccupied cap {max_total} reached)"
         target = set(keep)
 
+    # CHARGE_BOOST: user has asked "for the next N hours, favor charging."
+    # Override target back to day_min only (no extras), regardless of the
+    # mode we just computed. Skip during NIGHT / EVENING -- the family
+    # comfort case dominates when the sun is already gone.
+    if snap.charge_boost and mode not in ("NIGHT", "EVENING"):
+        old_mode = mode
+        mode = f"CHARGE_BOOST({old_mode})"
+        boost_until_hm = snap.charge_boost_until.astimezone().strftime("%H:%M")
+        skipped_note = (
+            f"skipped (CHARGE_BOOST until {boost_until_hm}: user asked to favor charging)"
+        )
+        target = set(day_min)
+        for r in all_rooms:
+            if r not in day_min:
+                reasons[r] = skipped_note
+
     # night_min reasons (and unoccupied label hint)
     for r in night_min:
         if r not in reasons:
             reasons[r] = f"night_min ({occ_label.lower()})"
+    # day_min reasons that survived (during DAY sub-modes)
+    for r in day_min:
+        if r not in reasons:
+            reasons[r] = f"day_min ({occ_label.lower()})"
     # Rooms outside any mode list (shouldn't happen, but log)
     for r in all_rooms:
         if r not in reasons:
-            reasons[r] = "skipped (not in active priority or night_min)"
+            reasons[r] = "skipped (not in active priority or day_min/night_min)"
+
+    # Weather annotation. If the forecast says PV is / will be materially
+    # depressed, prepend a note to every reason so the report and Telegram
+    # replies mention it. Purely informational -- decisions themselves
+    # already account for actual live PV via the mode computation.
+    weather_note = _weather_note(snap)
+    if weather_note:
+        for r in list(reasons.keys()):
+            reasons[r] = f"[{weather_note}] {reasons[r]}"
 
     # Cold-start baseline of last_action_at so future ticks can distinguish
     # our writes from external ones. We no longer WRITE to

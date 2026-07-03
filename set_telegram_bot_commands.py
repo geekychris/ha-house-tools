@@ -58,6 +58,7 @@ COMMANDS = [
     {"command": "smart_ac_report", "description": "Retrospective: SoC, mode times, per-AC runtime + est. draw"},
     {"command": "smart_ac_weekly", "description": "Weekly rollup: mode-minutes + total cost across last 7 days"},
     {"command": "override", "description": "Pin an AC state (e.g. /override living until 22:00, /override master for 2h)"},
+    {"command": "charge_boost", "description": "Favor battery charging over AC use (e.g. /charge_boost 5h, /charge_boost clear)"},
     {"command": "pump", "description": "Water pump status / on / off / boost / reset"},
 ]
 

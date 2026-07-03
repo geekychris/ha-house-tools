@@ -141,6 +141,11 @@ def main() -> None:
         *py("setup_smart_ac_modes.py"),
         env_extra={"HA_URL": ws_url},
     )
+    run(
+        "Phase 2.7: Smart AC charge-boost helpers",
+        *py("setup_smart_ac_charge_boost.py"),
+        env_extra={"HA_URL": ws_url},
+    )
 
     # ── Phase 3: Automations ---------------------------------------------------
     automation_scripts = [
@@ -158,6 +163,7 @@ def main() -> None:
         "create_telegram_smart_ac_report_command.py",
         "create_telegram_smart_ac_weekly_command.py",
         "create_telegram_override_command.py",
+        "create_telegram_charge_boost_command.py",
         "create_telegram_pump_command.py",
         "create_telegram_battery_alert.py",
         "create_ac_toggle_automations.py",

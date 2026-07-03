@@ -7,6 +7,9 @@
 
   "_rooms_comment": "Room slugs match the input_boolean.ac_<slug> entities you create with setup_ac_input_booleans.py. Below are examples for a 6-AC house; substitute your own.",
   "night_min_acs": ["master", "kids", "guest"],
+  "_day_min_comment": "Which ACs are forced ON during the DAY period (between sunrise+morning_offset and sunset-evening_offset). Falls back to night_min_acs if unset. Set to [] to have NO baseline during the day -- lets the scheduler decide who runs based on day_priority alone. Useful if you want DEFICIT/CHARGE_BEHIND to turn EVERYTHING off (including bedrooms) so charging is maximised.",
+  "day_min_acs":   ["master", "kids", "guest"],
+  "_day_priority_comment": "Ordered list of DAY extras the scheduler considers, first-preferred first. In ON_TRACK mode, one extra is added if the corresponding room needs cooling. In SURPLUS mode, all needed extras are added.",
   "day_priority":  ["living", "dining", "office"],
 
   "_evening_comment": "EVENING period = between effective_day_end (sun-based) and bedtime_hour. Family still up but solar gone. Target = evening_min_acs + evening_extra_required.",

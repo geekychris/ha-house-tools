@@ -64,6 +64,10 @@ AIR CONDITIONERS
   /ac on <room>  or  /ac off <room>
     rooms: master, guest, dining, living, office, kyle
     example: /ac on master
+  /charge_boost 5h            - favor charging for 5 hours (skips extras)
+  /charge_boost until 17:00   - same but until a specific time
+  /charge_boost clear         - cancel
+  /charge_boost               - show current state
   /override <room> [on|off] until <time-spec>
   /override <room> [on|off] for <duration>
   /override <room> clear
