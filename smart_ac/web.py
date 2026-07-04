@@ -1198,8 +1198,43 @@ def clear_override(room: str) -> None:
 # ---------------------------------------------------------------------- handler
 
 
+# Prefix-aware rewriting so smart_ac's UI works when served under a
+# reverse-proxy subpath (e.g. Marina Harbor's /berth/<dock>/<vessel>/).
+# When the request carries X-Forwarded-Prefix, absolute-path attrs in
+# emitted HTML get the prefix prepended so nav links, forms, and asset
+# fetches stay inside the berth. When the header is absent (direct
+# access), the rewriter is a no-op and behavior is unchanged.
+_PREFIX_HTML_ATTR = re.compile(
+    rb'''(?P<attr>\b(?:href|src|action|formaction)\s*=\s*)'''
+    rb'''(?P<quote>["'])(?P<path>/(?!/)[^"'#?\s]*)''',
+    re.IGNORECASE,
+)
+
+
+def _prefix_rewrite(body: bytes, prefix: str) -> bytes:
+    if not prefix:
+        return body
+    p = prefix.encode()
+    return _PREFIX_HTML_ATTR.sub(
+        lambda m: m["attr"] + m["quote"] + p + m["path"], body,
+    )
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    @property
+    def _fwd_prefix(self) -> str:
+        # Harbor sets X-Forwarded-Prefix on every proxied request; empty
+        # string when accessed directly.
+        return (self.headers.get("X-Forwarded-Prefix") or "").rstrip("/")
+
     def _respond(self, code: int, body: bytes, content_type: str = "text/html") -> None:
+        # Rewrite absolute paths in HTML/CSS bodies to stay inside the
+        # forwarded prefix. Skip for non-HTML content types (JSON, etc.).
+        prefix = self._fwd_prefix
+        if prefix and (
+            content_type.startswith("text/html") or content_type == "text/css"
+        ):
+            body = _prefix_rewrite(body, prefix)
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -1245,7 +1280,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.rfile.read(length)
                 start_calibration_in_background()
                 self.send_response(303)
-                self.send_header("Location", "/calibrate")
+                self.send_header("Location", self._fwd_prefix + "/calibrate")
                 self.end_headers()
                 return
             if path == "/override":
