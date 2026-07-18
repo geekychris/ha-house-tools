@@ -134,6 +134,34 @@ def parse_dt(s: str) -> dt.datetime:
     return dt.datetime.fromisoformat(s)
 
 
+def _parse_time(s: str) -> dt.time | None:
+    """HA input_datetime.state for a time-only helper is 'HH:MM:SS'.
+    Returns None for empty / unavailable / malformed input so the caller
+    can decide how to fail safe."""
+    if not s or s in ("unknown", "unavailable"):
+        return None
+    try:
+        return dt.time.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _in_time_window(now: dt.time, start: dt.time, end: dt.time) -> bool:
+    """True if `now` is inside [start, end) with midnight-wrapping.
+
+    - start < end : normal window, same day (e.g. 09:00-17:00).
+    - start > end : wraps midnight (e.g. 22:00-07:00 = 22:00-23:59:59 + 00:00-07:00).
+    - start == end: degenerate; treated as "always in-window" so a user
+      who leaves both fields at 00:00 doesn't accidentally disable the
+      bedroom permanently.
+    """
+    if start == end:
+        return True
+    if start < end:
+        return start <= now < end
+    return now >= start or now < end
+
+
 # ---------------------------------------------------------------------- state
 
 
@@ -155,13 +183,31 @@ class Snapshot:
         sun = states.get("sun.sun", {}).get("attributes", {})
         self.sunrise = parse_dt(sun["next_rising"]) if "next_rising" in sun else self.now
         self.sunset = parse_dt(sun["next_setting"]) if "next_setting" in sun else self.now
-        # If next_rising is tomorrow morning, we're after sunrise today --
-        # subtract a day so "sunrise" means today's, not tomorrow's.
-        if self.sunrise > self.now:
-            self.sunrise -= dt.timedelta(days=1)
-        # Same for sunset
-        if self.sunset < self.now:
-            self.sunset += dt.timedelta(days=1)
+        # `next_rising` / `next_setting` from sun.sun are always in the FUTURE
+        # (they roll forward the moment they pass). Downstream period math
+        # expects TODAY's sun events (past or future within the current local
+        # calendar day). Walk each event back by whole days until it lands
+        # inside [today_start, today_end) in local time.
+        #
+        # Previously this used simple "if future, subtract a day" heuristics
+        # which broke twice: sunset never walked back (because next_setting is
+        # always future); sunrise mid-evening walked to tomorrow's morning
+        # (only ~10h away, missing a naive 12h threshold), leaving
+        # effective_start = tomorrow morning and forcing NIGHT/DEFICIT.
+        local_now = self.now.astimezone()
+        today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + dt.timedelta(days=1)
+
+        def _within_today(t: dt.datetime) -> dt.datetime:
+            local = t.astimezone(local_now.tzinfo)
+            while local >= today_end:
+                local -= dt.timedelta(days=1)
+            while local < today_start:
+                local += dt.timedelta(days=1)
+            return local
+
+        self.sunrise = _within_today(self.sunrise)
+        self.sunset = _within_today(self.sunset)
 
         self.soc = f(cfg["soc_sensor"])
         self.battery_power_w = f(cfg["battery_power_sensor"])
@@ -190,6 +236,59 @@ class Snapshot:
         else:
             unocc_state = states.get(cfg.get("unoccupied_entity", ""), {}).get("state", "off")
             self.unoccupied = unocc_state == "on"
+
+        # Per-bedroom occupancy overlay. When cfg has an "occupancy_entity_for_room"
+        # mapping ({room: entity_id}), effective_params intersects night_min_acs
+        # and evening_min_acs against occupied rooms, so bedrooms whose toggle is
+        # OFF drop out of the always-cooled sets. Rooms NOT in the mapping are
+        # implicitly occupied -- omitting the config key entirely disables the
+        # feature and keeps prior behaviour.
+        occ_map: dict = cfg.get("occupancy_entity_for_room") or {}
+        self.occupancy_configured: set[str] = set(occ_map.keys())
+        self.occupied_bedrooms: set[str] = {
+            r for r, eid in occ_map.items()
+            if states.get(eid, {}).get("state", "on") == "on"
+        }
+
+        # Per-room comfort target sliders. cfg maps room -> input_number
+        # entity_id (see setup_comfort_target_helpers.py). Empty / absent =
+        # no live overrides, fall back to cfg['comfort_target_for_room'] or
+        # cfg['comfort_target_f']. Unavailable entity states are ignored so
+        # a broken sensor doesn't accidentally reset to a wild value.
+        ct_map: dict = cfg.get("comfort_target_entity_for_room") or {}
+        self.live_comfort_target: dict[str, float] = {}
+        for room, eid in ct_map.items():
+            raw = states.get(eid, {}).get("state", "")
+            if raw in ("", "unknown", "unavailable"):
+                continue
+            try:
+                self.live_comfort_target[room] = float(raw)
+            except ValueError:
+                continue
+
+        # Optional time-of-day windows per bedroom. When cfg has
+        # `occupancy_window_entities_for_room` = {room: {"from": <input_datetime>,
+        # "to": <input_datetime>}}, the room is only considered occupied
+        # when the current LOCAL time is inside [from, to). Windows wrap
+        # midnight (from > to means "active from `from` through midnight
+        # through `to` the next morning"). A degenerate window where
+        # from == to is treated as "always in-window" (window ignored).
+        # Rooms without a window entry are always in-window.
+        occ_win_map: dict = cfg.get("occupancy_window_entities_for_room") or {}
+        self.occupancy_window_configured: set[str] = set(occ_win_map.keys())
+        self.in_occupancy_window: set[str] = set()
+        local_now_time = self.now.astimezone().time()
+        for room, ents in occ_win_map.items():
+            frm = _parse_time(states.get(ents.get("from", ""), {}).get("state", ""))
+            to  = _parse_time(states.get(ents.get("to",   ""), {}).get("state", ""))
+            if frm is None or to is None:
+                # Missing / unparseable state -- fail safe by treating as
+                # in-window so a broken sensor doesn't silently disable a
+                # bedroom that's actually in use.
+                self.in_occupancy_window.add(room)
+                continue
+            if _in_time_window(local_now_time, frm, to):
+                self.in_occupancy_window.add(room)
 
         # Optional mode toggles (see setup_smart_ac_modes.py). All default
         # off; the scheduler falls back to normal behaviour if the helpers
@@ -317,13 +416,90 @@ class SchedulerState:
 # ----------------------------------------------------------------- decision logic
 
 
+def _proxy_indoor(snap: Snapshot) -> tuple[str, float] | None:
+    """Return (proxy_room, proxy_indoor_f) if cfg names a proxy room whose
+    sensor is currently reporting. Falls back to None so callers use the
+    outdoor threshold. Used by rooms that don't have their own sensor
+    (dining / office / kyle / guest at SF) so the decision tracks the
+    real indoor climate instead of the coarser outdoor threshold."""
+    proxy = snap.cfg.get("unsensored_proxy_room")
+    if not proxy:
+        return None
+    val = snap.indoor_f.get(proxy)
+    if val is None:
+        return None
+    return proxy, val
+
+
+def _room_target(room: str, snap: Snapshot, base_target_f: float) -> float:
+    """Per-room comfort target. Precedence:
+
+      1. Live HA input_number.comfort_target_<room> (snap.live_comfort_target)
+      2. cfg['comfort_target_for_room'][room] (JSON default)
+      3. base_target_f (mode-adjusted global)
+
+    The live slider wins so users can nudge on the fly from HA or Telegram
+    without editing files. Broken / unavailable sliders fall through to
+    the JSON default so a sensor blip doesn't reset behaviour."""
+    live = getattr(snap, "live_comfort_target", {}) or {}
+    if room in live:
+        return live[room]
+    overrides = snap.cfg.get("comfort_target_for_room") or {}
+    if room in overrides:
+        return float(overrides[room])
+    return base_target_f
+
+
 def room_needs_cooling(
     room: str, snap: Snapshot, comfort_target_f: float, outdoor_hot_threshold_f: float
 ) -> bool:
+    target = _room_target(room, snap, comfort_target_f)
     indoor = snap.indoor_f.get(room)
     if indoor is not None:
-        return indoor > comfort_target_f
+        return indoor > target
+    proxy = _proxy_indoor(snap)
+    if proxy is not None:
+        # Use another room's sensor as a stand-in. Compares against the
+        # per-room target (which may be higher than base for bedrooms), on
+        # the assumption that if the proxy room is above THIS room's
+        # target the unsensored room probably is too.
+        return proxy[1] > target
     return snap.outdoor_f > outdoor_hot_threshold_f
+
+
+def _temp_note(
+    room: str, snap: Snapshot, comfort_target_f: float, outdoor_hot_threshold_f: float
+) -> str:
+    """Formatted temperature signal for the reason string. Matches the
+    same logic as `room_needs_cooling` so the number the user sees is
+    the number the decision was actually made against. Examples:
+
+        " -- living 82.9F > 78F target"
+        " -- master 79.6F <= 83F target"
+        " -- no sensor; proxy living 82.8F > 78F target (kyle target 83F)"
+        " -- no room sensor; outdoor 92.9F > 80F unsensored-hot threshold"
+    """
+    target = _room_target(room, snap, comfort_target_f)
+    override_note = ""
+    if target != comfort_target_f:
+        override_note = f" ({room} target {target:.0f}F)"
+    indoor = snap.indoor_f.get(room)
+    if indoor is not None:
+        cmp = ">" if indoor > target else "<="
+        return f" -- {room} {indoor:.1f}F {cmp} {target:.0f}F target"
+    proxy = _proxy_indoor(snap)
+    if proxy is not None:
+        pname, pval = proxy
+        cmp = ">" if pval > target else "<="
+        return (
+            f" -- no sensor; proxy {pname} {pval:.1f}F {cmp} "
+            f"{target:.0f}F target{override_note}"
+        )
+    cmp = ">" if snap.outdoor_f > outdoor_hot_threshold_f else "<="
+    return (
+        f" -- no room sensor; outdoor {snap.outdoor_f:.1f}F {cmp} "
+        f"{outdoor_hot_threshold_f:.0f}F unsensored-hot threshold"
+    )
 
 
 def _weather_note(snap: Snapshot) -> str | None:
@@ -418,18 +594,58 @@ def effective_params(snap: Snapshot, cfg: dict) -> dict:
     # you say "at night keep master+kyle+guest, but during the day let
     # the scheduler decide who runs based on day_priority alone."
     day_min = list(cfg.get("day_min_acs", night_min))
+    # evening_min falls back to night_min if not explicitly configured, so
+    # existing setups keep their behaviour. Explicit evening_min lets you
+    # run FEWER bedrooms during the "family up but sun gone" window.
+    evening_min = list(cfg.get("evening_min_acs", night_min))
+
+    # Occupancy overlay: bedrooms whose input_boolean.bedroom_<room>_occupied
+    # toggle is OFF drop out of night_min and evening_min. day_min is left
+    # alone -- it's for daytime always-on rooms, not bedrooms tied to
+    # occupancy. Rooms not listed in occupancy_entity_for_room are treated
+    # as implicitly occupied, so omitting the config key keeps prior
+    # behaviour. See setup_bedroom_occupancy_helpers.py for the toggles.
+    #
+    # A per-bedroom time-of-day window (occupancy_window_entities_for_room)
+    # further restricts to hours the room is actually in use -- so kyle's
+    # room isn't cooled until his window opens (e.g. 22:00) even if his
+    # toggle is on. Rooms without a window configured are considered
+    # always in-window.
+    occ_configured: set[str] = getattr(snap, "occupancy_configured", set()) or set()
+    occupied: set[str] = getattr(snap, "occupied_bedrooms", set()) or set()
+    win_configured: set[str] = getattr(snap, "occupancy_window_configured", set()) or set()
+    in_window: set[str] = getattr(snap, "in_occupancy_window", set()) or set()
+
+    def _toggle_ok(r: str) -> bool:
+        return r not in occ_configured or r in occupied
+
+    def _window_ok(r: str) -> bool:
+        return r not in win_configured or r in in_window
+
+    # Reason categorization: distinguish "toggle off" from "outside window"
+    # so the /smart_ac output tells the user which one to change.
+    excluded_by_toggle: list[str] = []
+    excluded_by_window: list[str] = []
+    for r in sorted(set(night_min) | set(evening_min)):
+        if not _toggle_ok(r):
+            excluded_by_toggle.append(r)
+        elif not _window_ok(r):
+            excluded_by_window.append(r)
+
+    night_min = [r for r in night_min if _toggle_ok(r) and _window_ok(r)]
+    evening_min = [r for r in evening_min if _toggle_ok(r) and _window_ok(r)]
+
     return {
         "night_min": night_min,
         "day_min": day_min,
-        # evening_min falls back to night_min if not explicitly configured, so
-        # existing setups keep their behaviour. Explicit evening_min lets you
-        # run FEWER bedrooms during the "family up but sun gone" window.
-        "evening_min": list(cfg.get("evening_min_acs", night_min)),
+        "evening_min": evening_min,
         "priority": list(cfg["day_priority"]),
         "comfort_target_f": cfg["comfort_target_f"],
         "outdoor_hot": cfg["unsensored_assume_hot_above_outdoor_f"],
         "max_total": None,
         "evening_extras": list(cfg.get("evening_extra_required", [])),
+        "excluded_by_toggle": excluded_by_toggle,
+        "excluded_by_window": excluded_by_window,
         "mode_label": "OCC",
     }
 
@@ -486,6 +702,18 @@ def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
     effective_end = snap.sunset - evening
 
     reasons: dict[str, str] = {}
+
+    # Seed reasons for bedrooms the occupancy overlay filtered out. Set
+    # before mode-specific loops so downstream `if r not in reasons` guards
+    # preserve this label rather than overwriting with a mode-generic
+    # "skipped (NIGHT: ...)" that hides the real cause. Two distinct buckets
+    # tell the user which control to change:
+    #   - toggle: flip input_boolean.bedroom_<room>_occupied
+    #   - window: adjust the from/to input_datetime helpers
+    for r in eff.get("excluded_by_toggle", []):
+        reasons[r] = "unoccupied (bedroom occupancy toggle off)"
+    for r in eff.get("excluded_by_window", []):
+        reasons[r] = "outside occupancy window (bedroom_<room>_occupied_from/_to)"
 
     # Mode determination. EVENING is a special "night-like" mode: past the
     # solar day but before bedtime, so still occupied, so we keep
@@ -546,25 +774,52 @@ def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
         for r in priority:
             if r in target:
                 continue
+            note = _temp_note(r, snap, comfort_target_f, outdoor_hot)
             if needs(r) and len(target) < len(day_min) + 1:
                 target.add(r)
-                reasons[r] = "added (ON_TRACK: 1-extra slot, room needs cooling)"
+                reasons[r] = f"added (ON_TRACK: 1-extra slot, room needs cooling{note})"
+            elif not needs(r):
+                reasons[r] = f"skipped (ON_TRACK: room already comfortable{note})"
             else:
                 reasons[r] = (
-                    f"skipped (ON_TRACK: room temp <= {comfort_target_f}F)"
-                    if not needs(r)
-                    else "skipped (ON_TRACK: 1-extra slot already taken)"
+                    f"skipped (ON_TRACK: 1-extra slot already taken, "
+                    f"room WOULD need cooling{note})"
                 )
     else:  # SURPLUS
         target = set(day_min)
         for r in priority:
+            note = _temp_note(r, snap, comfort_target_f, outdoor_hot)
             if needs(r):
                 target.add(r)
-                reasons[r] = "added (SURPLUS: SoC at target, room needs cooling)"
+                reasons[r] = f"added (SURPLUS: SoC at target, room needs cooling{note})"
             else:
-                reasons[r] = (
-                    f"skipped (SURPLUS: room temp <= {comfort_target_f}F)"
-                )
+                reasons[r] = f"skipped (SURPLUS: room already comfortable{note})"
+
+    # Active occupancy window overrides mode default. A bedroom that has
+    # BOTH a toggle AND a window configured, is currently toggled ON, and
+    # is currently inside its window is treated as "actively in use right
+    # now" -- force-add it to the target regardless of mode.
+    #
+    # Why this exists: without this override, a bedroom stated as "in use
+    # until 08:00" would still get turned off by DEFICIT / CHARGE_BEHIND
+    # in the morning (empty day_min), because the occupancy overlay is
+    # otherwise only a NEGATIVE filter on night_min / evening_min. Users
+    # who go to the trouble of configuring a window expect it to mean
+    # "keep cooling this room while I'm in it", so force-include matches
+    # their mental model.
+    #
+    # Applies to normal modes only -- CHARGE_BOOST is an explicit user
+    # "please charge" opt-out that trumps everything (handled below).
+    # If the bedroom is already in target (mode already wanted it on), we
+    # keep the mode-specific reason for clarity.
+    occ_configured = getattr(snap, "occupancy_configured", set()) or set()
+    occupied = getattr(snap, "occupied_bedrooms", set()) or set()
+    win_configured = getattr(snap, "occupancy_window_configured", set()) or set()
+    in_window = getattr(snap, "in_occupancy_window", set()) or set()
+    for r in sorted(occ_configured & win_configured):
+        if r in occupied and r in in_window and r not in target:
+            target.add(r)
+            reasons[r] = "added (occupancy window active)"
 
     # Hard cap (unoccupied mode): drop lowest-priority extras until under cap.
     # night_min stays no matter what (configurable, usually empty in unoccupied).
@@ -949,6 +1204,17 @@ def publish_status(
         "enabled": snap.enabled,
         "unoccupied": snap.unoccupied,
         "notify_telegram": snap.notify_telegram,
+        "occupied_bedrooms": sorted(getattr(snap, "occupied_bedrooms", set())),
+        "occupancy_configured": sorted(getattr(snap, "occupancy_configured", set())),
+        "in_occupancy_window": sorted(getattr(snap, "in_occupancy_window", set())),
+        "occupancy_window_configured": sorted(getattr(snap, "occupancy_window_configured", set())),
+        "comfort_target_by_room": {
+            r: _room_target(r, snap, snap.cfg["comfort_target_f"])
+            for r in sorted(
+                set(snap.cfg.get("night_min_acs", []))
+                | set(snap.cfg.get("day_priority", []))
+            )
+        },
         "target_on": sorted([r for r, on in target.items() if on]),
         "target_off": sorted([r for r, on in target.items() if not on]),
         "reasons": reasons,
