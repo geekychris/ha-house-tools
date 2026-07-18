@@ -179,8 +179,17 @@ class Snapshot:
         notify_state = states.get(cfg.get("notify_entity_toggle", ""), {}).get("state", "off")
         self.notify_telegram = notify_state == "on"
 
-        unocc_state = states.get(cfg.get("unoccupied_entity", ""), {}).get("state", "off")
-        self.unoccupied = unocc_state == "on"
+        # Occupancy source. Prefer positive-polarity `occupied_entity`
+        # (ON = house is occupied); fall back to legacy `unoccupied_entity`
+        # (ON = house is unoccupied) if the positive one isn't configured.
+        # Both defaults degrade to "occupied" when the state is missing.
+        occ_eid = cfg.get("occupied_entity")
+        if occ_eid:
+            occ_state = states.get(occ_eid, {}).get("state", "on")
+            self.unoccupied = occ_state == "off"
+        else:
+            unocc_state = states.get(cfg.get("unoccupied_entity", ""), {}).get("state", "off")
+            self.unoccupied = unocc_state == "on"
 
         # Optional mode toggles (see setup_smart_ac_modes.py). All default
         # off; the scheduler falls back to normal behaviour if the helpers
