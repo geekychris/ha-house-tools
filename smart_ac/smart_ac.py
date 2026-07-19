@@ -387,6 +387,14 @@ class SchedulerState:
         # writes one line to observations.jsonl, and drops the entry.
         # See main tick loop.
         self.pending_observations: list[dict] = []
+        # SoC-safety shed step (index into cfg["soc_shed_schedule"] sorted
+        # ascending by below_soc). None = not currently shedding. Persisted
+        # so we only notify on transitions, not every tick.
+        self.soc_shed_step_idx: int | None = None
+        # Transient (not persisted). Populated by apply_soc_safety() when
+        # crossing a shed threshold; consumed by the main tick loop, which
+        # pushes it to Telegram (if notify_telegram is on) and clears.
+        self.pending_notification: str | None = None
 
     @classmethod
     def load(cls) -> "SchedulerState":
@@ -397,6 +405,7 @@ class SchedulerState:
                 s.last_action_at = d.get("last_action_at", {})
                 s.manual_override_until = d.get("manual_override_until", {})
                 s.pending_observations = d.get("pending_observations", [])
+                s.soc_shed_step_idx = d.get("soc_shed_step_idx")
             except Exception:
                 pass
         return s
@@ -406,6 +415,7 @@ class SchedulerState:
             "last_action_at": self.last_action_at,
             "manual_override_until": self.manual_override_until,
             "pending_observations": self.pending_observations,
+            "soc_shed_step_idx": self.soc_shed_step_idx,
         }, indent=2))
 
     def get_dt(self, dct: dict[str, str], room: str) -> dt.datetime | None:
@@ -671,6 +681,138 @@ def battery_kwh(cfg: dict) -> float:
     return cfg["battery_ah"] * cfg["battery_nominal_v"] / 1000.0
 
 
+# SoC hysteresis on recovery: to LEAVE a shed step you must climb
+# below_soc + this delta. Prevents rapid oscillation right on a threshold.
+SOC_SHED_RECOVERY_DELTA = 3.0
+
+
+def apply_soc_safety(
+    target: set[str],
+    snap: Snapshot,
+    sched: SchedulerState,
+    cfg: dict,
+    reasons: dict[str, str],
+) -> set[str]:
+    """SoC-based safety net that incrementally sheds AC rooms as the battery
+    drops through configured thresholds.
+
+    Configured via ``cfg["soc_shed_schedule"]`` -- a list of steps like:
+
+        [
+          {"below_soc": 40, "keep_max": null,
+           "note": "Battery below 40% -- monitoring."},
+          {"below_soc": 30, "keep_max": 1,
+           "note": "Battery at 30% -- keeping only the highest-priority AC."},
+          {"below_soc": 20, "keep_max": 0,
+           "note": "CRITICAL: battery at 20%. All ACs off. Intervene."},
+        ]
+
+    - ``keep_max=null`` (or missing): monitoring only, no cap change. Still
+      fires a Telegram warning on threshold entry.
+    - ``keep_max=N``: shed until at most N rooms remain in ``target``,
+      dropping by REVERSE ``day_priority`` (lowest priority first, so
+      ``living`` and ``master`` survive longest).
+    - ``keep_max=0``: shed everything.
+
+    ``target`` and ``reasons`` are the ones from ``decide()`` post-mode
+    selection. This applies AFTER mode/max_total/charge_boost logic but
+    BEFORE explicit user overrides -- a user's ``/override`` pin still
+    wins, matching "user knows best when they've explicitly told us".
+
+    Notifications fire exactly once per threshold transition (both descent
+    and recovery), gated by hysteresis of ``SOC_SHED_RECOVERY_DELTA``.
+    They're stored on ``sched.pending_notification`` for the tick loop to
+    push (Telegram, subject to ``snap.notify_telegram``). The persisted
+    step index in ``sched.soc_shed_step_idx`` lets the check work across
+    tick loop restarts.
+
+    Fail-safe intent: if ``snap.soc`` reads as ``0`` because the EG4
+    integration went stale (the exact failure mode from 2026-07-18), the
+    schedule engages its most-restrictive step and everything sheds --
+    which is what we want when we can't read the battery.
+    """
+    schedule = cfg.get("soc_shed_schedule") or []
+    if not schedule:
+        return target
+
+    # Order ascending by below_soc so index 0 is the MOST restrictive.
+    ordered = sorted(schedule, key=lambda s: s.get("below_soc", 0))
+
+    prev_idx = sched.soc_shed_step_idx
+
+    # Pick the most-restrictive step whose threshold is currently met,
+    # with hysteresis: to LEAVE a step you have to climb above its
+    # `below_soc + SOC_SHED_RECOVERY_DELTA`.
+    active_idx: int | None = None
+    for i, step in enumerate(ordered):
+        thr = step.get("below_soc", 0)
+        was_here_or_deeper = prev_idx is not None and i >= prev_idx
+        if was_here_or_deeper:
+            if snap.soc <= thr + SOC_SHED_RECOVERY_DELTA:
+                active_idx = i
+                break
+        else:
+            if snap.soc <= thr:
+                active_idx = i
+                break
+
+    sched.soc_shed_step_idx = active_idx
+
+    # Transition notification -- fires on ANY change (deeper OR lighter).
+    if active_idx != prev_idx:
+        if active_idx is None:
+            # Full recovery: we're above the lightest threshold.
+            recovered_from = ordered[prev_idx] if prev_idx is not None else None
+            recovered_thr = (
+                recovered_from.get("below_soc") if recovered_from else "?"
+            )
+            sched.pending_notification = (
+                f"[safety] SoC recovered to {snap.soc:.0f}% "
+                f"(above the {recovered_thr}% shed threshold). "
+                f"Smart AC safety released."
+            )
+        else:
+            step = ordered[active_idx]
+            note = step.get("note") or (
+                f"SoC {snap.soc:.0f}% <= {step.get('below_soc')}% shed threshold"
+            )
+            sched.pending_notification = (
+                f"[safety] SoC {snap.soc:.0f}%: {note}"
+            )
+
+    if active_idx is None:
+        return target
+
+    step = ordered[active_idx]
+    keep_max = step.get("keep_max")
+    if keep_max is None:
+        # Monitoring step -- no shed, just the warning above.
+        return target
+
+    if len(target) <= keep_max:
+        return target
+
+    # Shed by REVERSE day_priority. day_priority lists rooms
+    # highest-priority first; keep the earliest `keep_max` of those.
+    priority_order = list(cfg.get("day_priority", []))
+
+    def rank(r: str) -> int:
+        try:
+            return priority_order.index(r)
+        except ValueError:
+            return len(priority_order)  # unknown rooms go last
+
+    by_priority = sorted(target, key=rank)
+    kept = set(by_priority[:keep_max])
+    dropped = set(target) - kept
+    for r in dropped:
+        reasons[r] = (
+            f"shed (SoC safety: {snap.soc:.0f}% <= "
+            f"{step.get('below_soc')}%, keep_max={keep_max})"
+        )
+    return kept
+
+
 def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
     dict[str, bool], str, dict[str, str]
 ]:
@@ -871,6 +1013,13 @@ def decide(snap: Snapshot, sched: SchedulerState, cfg: dict) -> tuple[
     if weather_note:
         for r in list(reasons.keys()):
             reasons[r] = f"[{weather_note}] {reasons[r]}"
+
+    # SoC safety net. Applied AFTER mode-specific target selection but BEFORE
+    # the explicit-override loop below, so a user who has manually pinned a
+    # room via /override still wins (the safety warns via Telegram; the user
+    # can react manually). Also updates `reasons` for shed rooms and sets
+    # `sched.pending_notification` on threshold transitions.
+    target = apply_soc_safety(target, snap, sched, cfg, reasons)
 
     # Cold-start baseline of last_action_at so future ticks can distinguish
     # our writes from external ones. We no longer WRITE to
@@ -1264,6 +1413,20 @@ def main() -> int:
             # the mode at action-time in `before`.
             process_observations(sched, snap, mode="?")
             target, mode, reasons = decide(snap, sched, cfg)
+
+            # Safety notification produced during decide() -- push before we
+            # take actions, so the user gets the "sched is about to shed"
+            # warning even if the action itself is preview-only. Consume
+            # unconditionally (clear even if push_telegram is disabled) so a
+            # stale message never re-emits on a later tick.
+            safety_msg = sched.pending_notification
+            sched.pending_notification = None
+            if safety_msg:
+                push_logbook(cfg, safety_msg, entity_id=cfg["status_sensor_entity"])
+                logging.warning("%s", safety_msg)
+                if snap.notify_telegram:
+                    push_telegram(cfg, safety_msg)
+
             actions: list[tuple[str, str]] = []
             if snap.enabled:
                 actions = apply_targets(target, snap, sched, cfg)
