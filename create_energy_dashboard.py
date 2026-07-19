@@ -356,7 +356,7 @@ DASHBOARD_CONFIG = {
                             "entities": [
                                 {"entity": "input_boolean.smart_ac_enabled", "name": "Smart scheduler"},
                                 {"entity": "input_boolean.smart_ac_notify_telegram", "name": "Notify on Telegram"},
-                                {"entity": "input_boolean.house_unoccupied", "name": "House unoccupied"},
+                                {"entity": "input_boolean.house_occupied", "name": "House occupied"},
                                 {"type": "section"},
                                 {"entity": "input_boolean.ac_master", "name": "Master"},
                                 {"entity": "input_boolean.ac_guest", "name": "Guest"},
