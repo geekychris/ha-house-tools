@@ -1341,7 +1341,18 @@ def publish_status(
     actions: list[tuple[str, str]],
     reasons: dict[str, str],
     cfg: dict,
+    sched: SchedulerState | None = None,
 ) -> None:
+    # SoC safety plan block. Consumers (iOS app, SolarSage widget) render
+    # this as "what will smart_ac do if the battery keeps dropping?" -- the
+    # active tier plus the next thresholds that will fire.
+    shed_block = _safety_plan_attrs(snap, sched, cfg)
+
+    # Human-readable "current intent" sentence. Same info the log line
+    # captures, but shaped for a UI card. Kept in publish_status so both
+    # the iOS app and SolarSage read one blob rather than reinventing.
+    intent = _intent_summary(snap, mode, target, cfg, shed_block)
+
     state_attrs = {
         "mode": mode,
         "soc": round(snap.soc, 1),
@@ -1373,8 +1384,126 @@ def publish_status(
         "sunset": snap.sunset.isoformat(),
         "friendly_name": "Smart AC status",
         "icon": "mdi:air-conditioner",
+        # -- Introspection: what's the plan? --
+        "intent_summary": intent,
+        **shed_block,
     }
     ha_set_state(cfg, cfg["status_sensor_entity"], mode, state_attrs)
+
+
+def _safety_plan_attrs(
+    snap: Snapshot,
+    sched: SchedulerState | None,
+    cfg: dict,
+) -> dict:
+    """Returns the SoC safety plan block for publish_status().
+
+    Emits:
+      - soc_shed_schedule: raw config list (ordered ascending by below_soc),
+        each entry with its below_soc, keep_max, note.
+      - soc_shed_active_idx: index into soc_shed_schedule that is currently
+        engaged (None = above all thresholds).
+      - soc_shed_active_step: the step object currently in force (None if
+        no shed active).
+      - soc_shed_next_action: {below_soc, keep_max, note, delta_soc} of the
+        NEXT more-restrictive step that will fire if SoC continues to drop
+        (None if we're already at the most-restrictive step or no schedule).
+      - soc_shed_recovery_at: SoC at which the currently-active tier will
+        release (below_soc + SOC_SHED_RECOVERY_DELTA). None if no shed active.
+    """
+    schedule = cfg.get("soc_shed_schedule") or []
+    if not schedule:
+        return {
+            "soc_shed_schedule": [],
+            "soc_shed_active_idx": None,
+            "soc_shed_active_step": None,
+            "soc_shed_next_action": None,
+            "soc_shed_recovery_at": None,
+        }
+    ordered = sorted(schedule, key=lambda s: s.get("below_soc", 0))
+    active_idx = sched.soc_shed_step_idx if sched is not None else None
+
+    active_step = ordered[active_idx] if active_idx is not None else None
+    # "Next" step (more restrictive than active) = the step at index active_idx-1
+    # in the ordered list (lower index = lower threshold = more restrictive).
+    # If active is None, the next thing to fire is the HIGHEST-threshold step
+    # (ordered[-1]) since that's what triggers first as SoC drops.
+    if active_idx is None:
+        next_step = ordered[-1]  # highest threshold, fires first
+    elif active_idx == 0:
+        next_step = None  # already at most restrictive
+    else:
+        next_step = ordered[active_idx - 1]
+
+    next_action = None
+    if next_step is not None:
+        next_thr = next_step.get("below_soc")
+        next_action = {
+            "below_soc": next_thr,
+            "keep_max": next_step.get("keep_max"),
+            "note": next_step.get("note"),
+            "delta_soc": (
+                round(snap.soc - next_thr, 1) if isinstance(next_thr, (int, float)) else None
+            ),
+        }
+
+    recovery_at = None
+    if active_step is not None:
+        thr = active_step.get("below_soc")
+        if isinstance(thr, (int, float)):
+            recovery_at = round(thr + SOC_SHED_RECOVERY_DELTA, 1)
+
+    return {
+        "soc_shed_schedule": ordered,
+        "soc_shed_active_idx": active_idx,
+        "soc_shed_active_step": active_step,
+        "soc_shed_next_action": next_action,
+        "soc_shed_recovery_at": recovery_at,
+    }
+
+
+def _intent_summary(
+    snap: Snapshot,
+    mode: str,
+    target: dict[str, bool],
+    cfg: dict,
+    shed_block: dict,
+) -> str:
+    """One-line human sentence describing what smart_ac is doing right now.
+
+    Read by the iOS app and SolarSage plan widget as a compact top-of-card
+    summary. Distinct from the per-room `reasons` dict (which explains WHY
+    each individual room is / isn't in the target).
+    """
+    on = sorted([r for r, want in target.items() if want])
+    if not snap.enabled:
+        prefix = "PREVIEW (kill switch off): would"
+    else:
+        prefix = "Currently"
+
+    occ = "unoccupied" if snap.unoccupied else "occupied"
+
+    if on:
+        rooms_str = ", ".join(on)
+        head = f"{prefix} run {rooms_str} in {mode} ({occ})"
+    else:
+        head = f"{prefix} run no ACs in {mode} ({occ})"
+
+    # Add safety plan hint.
+    if shed_block.get("soc_shed_active_step"):
+        head += (
+            f" · SoC {snap.soc:.0f}% has engaged safety tier "
+            f"below {shed_block['soc_shed_active_step'].get('below_soc')}%"
+        )
+    elif shed_block.get("soc_shed_next_action"):
+        na = shed_block["soc_shed_next_action"]
+        head += (
+            f" · next safety fires at SoC "
+            f"{na.get('below_soc')}% ({-na.get('delta_soc'):.0f}% below now)"
+            if na.get("delta_soc") is not None
+            else ""
+        )
+    return head
 
 
 # ----------------------------------------------------------------- main loop
@@ -1435,7 +1564,7 @@ def main() -> int:
             # Queue this tick's actions for observation on the next tick.
             enqueue_observation(sched, snap, mode, reasons, actions, cfg)
             sched.save()
-            publish_status(snap, mode, target, actions, reasons, cfg)
+            publish_status(snap, mode, target, actions, reasons, cfg, sched=sched)
             log_decision(snap, mode, target, actions, reasons)
 
             # HA Logbook: only on mode change or when actions taken (avoid spam).
