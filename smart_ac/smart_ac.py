@@ -1497,12 +1497,12 @@ def _intent_summary(
         )
     elif shed_block.get("soc_shed_next_action"):
         na = shed_block["soc_shed_next_action"]
-        head += (
-            f" · next safety fires at SoC "
-            f"{na.get('below_soc')}% ({-na.get('delta_soc'):.0f}% below now)"
-            if na.get("delta_soc") is not None
-            else ""
-        )
+        delta = na.get("delta_soc")
+        thr = na.get("below_soc")
+        if delta is not None and thr is not None:
+            # delta = snap.soc - threshold. Positive = headroom above trigger.
+            headroom = f"{delta:.0f}% headroom" if delta > 0 else "AT trigger"
+            head += f" · next safety at SoC {thr}% ({headroom})"
     return head
 
 
