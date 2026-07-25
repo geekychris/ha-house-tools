@@ -168,6 +168,7 @@ def page(title: str, body: str, refresh_sec: int | None = None) -> bytes:
 <header>
   <span class="title">smart_ac</span>
   <a href="/">Dashboard</a>
+  <a href="/timeline">Timeline</a>
   <a href="/reports">Reports</a>
   <a href="/decisions">Decisions</a>
   <a href="/observations">Observations</a>
@@ -598,15 +599,34 @@ def _ha_history(entity_id: str, start_iso: str, end_iso: str) -> list[dict]:
     return out
 
 
+def _x_tick_fmt(span_seconds: float) -> str:
+    """Choose an x-axis label format based on the span."""
+    if span_seconds > 24 * 3600:
+        return "%m-%d %H:%M"
+    return "%H:%M"
+
+
 def _svg_line_chart(series: list[tuple[str, list[dict], str]], title: str,
-                    width: int = 800, height: int = 240) -> str:
+                    width: int = 800, height: int = 260,
+                    shared_y: bool = False, unit: str = "",
+                    include_zero: bool = True) -> str:
     """Render one or more time-series as an SVG line chart.
     series: list of (label, points, color) where points is list of
     {"t": iso, "v": float}.
 
-    All series share the same X axis (time span). Each has its own Y
-    autoscale, drawn as a light line + label."""
-    pad_l, pad_r, pad_t, pad_b = 50, 20, 30, 30
+    All series share the same X axis (time span).
+
+    - shared_y=False (default): each series has its own Y autoscale.
+      Y-axis labels are shown only when there's a single series.
+    - shared_y=True: all series share one Y range (min/max across all),
+      and Y-axis ticks + horizontal gridlines are drawn.
+
+    unit: appended to y-axis labels and legend (e.g. "W", "°F", "%").
+    include_zero: if False, tight-fit the y-range to the data (useful for
+      temperature charts where 0°F is uninteresting). If True, always
+      extends the range to include 0.
+    """
+    pad_l, pad_r, pad_t, pad_b = 60, 20, 30, 34
     plot_w = width - pad_l - pad_r
     plot_h = height - pad_t - pad_b
 
@@ -626,22 +646,66 @@ def _svg_line_chart(series: list[tuple[str, list[dict], str]], title: str,
     def x_for(ts: dt.datetime) -> float:
         return pad_l + plot_w * ((ts - t_min).total_seconds() / span_s)
 
+    # Shared-y range (used when shared_y=True or when there's only one series)
+    all_vals: list[float] = [p["v"] for _, pts, _ in series for p in pts if pts]
+    global_min = min(all_vals) if all_vals else 0.0
+    global_max = max(all_vals) if all_vals else 1.0
+    if include_zero:
+        # Extend the range to include zero, so the scale reads naturally
+        # for magnitude-like data (power, %-full, etc).
+        if global_min > 0:
+            global_min = 0.0
+        if global_max < 0:
+            global_max = 0.0
+    else:
+        # Tight-fit with a small padding so lines don't touch the top/bottom.
+        pad = max((global_max - global_min) * 0.08, 0.5)
+        global_min -= pad
+        global_max += pad
+    if global_max - global_min < 1e-6:
+        global_max = global_min + 1.0
+
+    show_yaxis = shared_y or len([1 for _, pts, _ in series if pts]) <= 1
+
     parts: list[str] = [
         f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
         f'style="width:100%;max-width:{width}px">',
         f'<rect x="0" y="0" width="{width}" height="{height}" fill="#171a22"/>',
     ]
 
+    # Y-axis gridlines + labels (drawn behind data).
+    if show_yaxis:
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+            y = pad_t + plot_h - plot_h * frac
+            v = global_min + (global_max - global_min) * frac
+            parts.append(
+                f'<line x1="{pad_l}" y1="{y:.1f}" x2="{pad_l + plot_w}" '
+                f'y2="{y:.1f}" stroke="#23283a" stroke-dasharray="2,3"/>'
+                f'<text x="{pad_l - 6}" y="{y + 4:.1f}" fill="#8592a8" '
+                f'font-size="11" text-anchor="end">{v:.1f}{unit}</text>'
+            )
+
     # Draw each series
     legend_x = pad_l
     for idx, (label, pts, color) in enumerate(series):
         if not pts:
             continue
-        vals = [p["v"] for p in pts]
-        v_min, v_max = min(vals), max(vals)
-        v_min = min(v_min, 0.0)
-        if v_max - v_min < 1e-6:
-            v_max = v_min + 1.0
+        if shared_y:
+            v_min, v_max = global_min, global_max
+        else:
+            vals = [p["v"] for p in pts]
+            v_min, v_max = min(vals), max(vals)
+            if include_zero:
+                if v_min > 0:
+                    v_min = 0.0
+                if v_max < 0:
+                    v_max = 0.0
+            else:
+                pad = max((v_max - v_min) * 0.08, 0.5)
+                v_min -= pad
+                v_max += pad
+            if v_max - v_min < 1e-6:
+                v_max = v_min + 1.0
 
         def y_for(v: float, vmin=v_min, vmax=v_max) -> float:
             return pad_t + plot_h - plot_h * ((v - vmin) / (vmax - vmin))
@@ -658,23 +722,28 @@ def _svg_line_chart(series: list[tuple[str, list[dict], str]], title: str,
                 f'<polyline fill="none" stroke="{color}" stroke-width="1.5" '
                 f'points="{" ".join(path_pts)}"/>'
             )
-        # Legend entry (top-left)
+        # Legend entry (top-left). Include per-series max when NOT shared_y,
+        # so per-series scale is at least summarised.
+        legend_text = html.escape(label)
+        if not shared_y:
+            legend_text += f" (max {v_max:.1f}{unit})"
         parts.append(
             f'<circle cx="{legend_x + 6}" cy="16" r="4" fill="{color}"/>'
             f'<text x="{legend_x + 14}" y="20" fill="#dde3ec" font-size="12">'
-            f'{html.escape(label)} (max {v_max:.1f})</text>'
+            f'{legend_text}</text>'
         )
         legend_x += 180
 
-    # X axis: 4 hourly labels
+    # X axis: 5 labels; include date component when span is > 24h.
+    x_fmt = _x_tick_fmt(span_s)
     for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         x = pad_l + plot_w * frac
-        t = t_min + dt.timedelta(seconds=span_s * frac)
+        t = (t_min + dt.timedelta(seconds=span_s * frac)).astimezone()
         parts.append(
             f'<line x1="{x:.1f}" y1="{pad_t + plot_h}" x2="{x:.1f}" '
             f'y2="{pad_t + plot_h + 4}" stroke="#8592a8"/>'
             f'<text x="{x:.1f}" y="{pad_t + plot_h + 18}" fill="#8592a8" '
-            f'font-size="11" text-anchor="middle">{t.strftime("%H:%M")}</text>'
+            f'font-size="11" text-anchor="middle">{t.strftime(x_fmt)}</text>'
         )
     # Chart baseline
     parts.append(
@@ -732,6 +801,226 @@ def _svg_bar_chart(labels: list[str], values: list[float], title: str,
         f'<div class="card"><h3>{html.escape(title)}</h3>'
         + "".join(parts) + "</div>"
     )
+
+
+def _parse_iso(s: str | None) -> dt.datetime | None:
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _read_decisions_since(hours: float) -> list[dict]:
+    """Load JSONL records from decisions.log (+ rotated .1 if it exists)
+    within the last `hours`. Records are sorted ascending by timestamp."""
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    records: list[dict] = []
+    paths = []
+    rotated = DECISIONS_LOG.with_name(DECISIONS_LOG.name + ".1")
+    if rotated.exists():
+        paths.append(rotated)
+    paths.append(DECISIONS_LOG)
+    for path in paths:
+        try:
+            with path.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = _parse_iso(rec.get("ts"))
+                    if ts is None or ts < cutoff:
+                        continue
+                    records.append(rec)
+        except OSError:
+            continue
+    records.sort(key=lambda r: r.get("ts", ""))
+    return records
+
+
+def _svg_ac_gantt(records: list[dict], rooms: list[str], title: str,
+                  width: int = 800, row_h: int = 22) -> str:
+    """Per-room ON timeline. Each row = one room; filled bars mark
+    intervals where ac_on[room] was True."""
+    if not records or not rooms:
+        return f'<div class="card"><h3>{html.escape(title)}</h3><p class="subtle">(no data)</p></div>'
+    pad_l, pad_r, pad_t, pad_b = 90, 20, 20, 30
+    plot_w = width - pad_l - pad_r
+    plot_h = row_h * len(rooms)
+    height = pad_t + pad_b + plot_h
+
+    t_min = _parse_iso(records[0].get("ts"))
+    t_max = _parse_iso(records[-1].get("ts"))
+    if t_min is None or t_max is None:
+        return f'<div class="card"><h3>{html.escape(title)}</h3><p class="subtle">(no timestamps)</p></div>'
+    span_s = max((t_max - t_min).total_seconds(), 1)
+
+    def x_for(ts: dt.datetime) -> float:
+        return pad_l + plot_w * ((ts - t_min).total_seconds() / span_s)
+
+    parts: list[str] = [
+        f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+        f'style="width:100%;max-width:{width}px">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#171a22"/>',
+    ]
+    for row_idx, room in enumerate(rooms):
+        y = pad_t + row_idx * row_h
+        parts.append(
+            f'<text x="{pad_l - 8}" y="{y + row_h/2 + 4:.1f}" fill="#dde3ec" '
+            f'font-size="12" text-anchor="end">{html.escape(room)}</text>'
+        )
+        parts.append(
+            f'<line x1="{pad_l}" y1="{y + row_h/2:.1f}" x2="{pad_l + plot_w}" '
+            f'y2="{y + row_h/2:.1f}" stroke="#23283a"/>'
+        )
+        seg_start: dt.datetime | None = None
+        prev_ts: dt.datetime | None = None
+        for rec in records:
+            ts = _parse_iso(rec.get("ts"))
+            if ts is None:
+                continue
+            on = bool((rec.get("ac_on") or {}).get(room, False))
+            if on and seg_start is None:
+                seg_start = ts
+            elif not on and seg_start is not None:
+                end_ts = prev_ts if prev_ts else ts
+                x1, x2 = x_for(seg_start), x_for(end_ts)
+                parts.append(
+                    f'<rect x="{x1:.1f}" y="{y + 3:.1f}" '
+                    f'width="{max(x2 - x1, 1):.1f}" height="{row_h - 6}" '
+                    f'fill="#56a0ff" opacity="0.85"/>'
+                )
+                seg_start = None
+            prev_ts = ts
+        if seg_start is not None:
+            x1, x2 = x_for(seg_start), x_for(t_max)
+            parts.append(
+                f'<rect x="{x1:.1f}" y="{y + 3:.1f}" '
+                f'width="{max(x2 - x1, 1):.1f}" height="{row_h - 6}" '
+                f'fill="#56a0ff" opacity="0.85"/>'
+            )
+    x_fmt = _x_tick_fmt(span_s)
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        x = pad_l + plot_w * frac
+        t = t_min + dt.timedelta(seconds=span_s * frac)
+        local = t.astimezone()
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{pad_t + plot_h}" x2="{x:.1f}" '
+            f'y2="{pad_t + plot_h + 4}" stroke="#8592a8"/>'
+            f'<text x="{x:.1f}" y="{pad_t + plot_h + 18}" fill="#8592a8" '
+            f'font-size="11" text-anchor="middle">{local.strftime(x_fmt)}</text>'
+        )
+    parts.append("</svg>")
+    return (
+        f'<div class="card"><h3>{html.escape(title)}</h3>'
+        + "".join(parts) + "</div>"
+    )
+
+
+def view_timeline(query_params: dict) -> bytes:
+    """Charts of the last N hours of decision-log records."""
+    try:
+        hours = float(query_params.get("hours", ["24"])[0])
+    except Exception:
+        hours = 24.0
+    hours = max(1.0, min(hours, 168.0))
+
+    records = _read_decisions_since(hours)
+    if not records:
+        return page(
+            "Timeline",
+            f'<div class="card">No decision records in the last {hours:g}h. '
+            f'Is smart-ac running? Check <code>{DECISIONS_LOG}</code>.</div>',
+        )
+
+    def as_line(getter, keep=lambda v: True):
+        out = []
+        for r in records:
+            v = getter(r)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if not keep(fv):
+                continue
+            out.append({"t": r["ts"], "v": fv})
+        return out
+
+    # Drop obviously-bogus temperature readings. HA sensors return 0.0 when
+    # the underlying integration goes stale (seen on 2026-07-19 during the
+    # EG4 outage). SF never sees indoor OR outdoor below freezing in summer,
+    # so anything under 32F is a sensor artefact, not a temperature.
+    valid_temp = lambda v: v >= 32.0
+    soc = as_line(lambda r: r.get("soc"))
+    pv = as_line(lambda r: r.get("pv_power_w"))
+    load = as_line(lambda r: r.get("load_w"))
+    battery = as_line(lambda r: r.get("battery_power_w"))
+    outdoor = as_line(lambda r: r.get("outdoor_f"), keep=valid_temp)
+
+    rooms_indoor: set[str] = set()
+    rooms_ac: set[str] = set()
+    for r in records:
+        rooms_indoor.update((r.get("indoor_f") or {}).keys())
+        rooms_ac.update((r.get("ac_on") or {}).keys())
+
+    palette = ["#f2c94c", "#eb5757", "#af52de", "#27ae60", "#56a0ff", "#ff9f43"]
+    indoor_series: list[tuple[str, list[dict], str]] = []
+    for i, room in enumerate(sorted(rooms_indoor)):
+        indoor_series.append(
+            (f"indoor:{room}",
+             as_line(lambda r, k=room: (r.get("indoor_f") or {}).get(k), keep=valid_temp),
+             palette[i % len(palette)])
+        )
+    temp_series = [("outdoor", outdoor, "#eb5757")] + indoor_series
+
+    hours_options = [3, 6, 12, 24, 48, 72, 168]
+    hour_links = " · ".join(
+        f'<strong>{h}h</strong>' if abs(h - hours) < 0.5
+        else f'<a href="/timeline?hours={h}">{h}h</a>'
+        for h in hours_options
+    )
+
+    soc_chart = _svg_line_chart(
+        [("SoC", soc, "#27ae60")],
+        f"Battery SoC (last {hours:g}h · {len(records)} ticks)",
+        unit="%",
+    )
+    power_chart = _svg_line_chart(
+        [("PV", pv, "#f2c94c"), ("Load", load, "#56a0ff")],
+        "PV vs Load",
+        shared_y=True, unit=" W",
+    )
+    battery_chart = _svg_line_chart(
+        [("Battery (neg=discharge)", battery, "#af52de")],
+        "Battery net power",
+        unit=" W",
+    )
+    temp_chart = _svg_line_chart(
+        temp_series, "Outdoor + indoor temperatures",
+        shared_y=True, unit="°F", include_zero=False,
+    )
+    ac_chart = _svg_ac_gantt(records, sorted(rooms_ac), "AC ON intervals per room")
+
+    body = f"""
+<div class="card">
+  <h1>Decision timeline</h1>
+  <p class="subtle">Reads <code>{html.escape(DECISIONS_LOG.name)}</code> directly.
+     Window: {hour_links}</p>
+</div>
+{soc_chart}
+{power_chart}
+{battery_chart}
+{temp_chart}
+{ac_chart}
+"""
+    return page("Timeline", body, refresh_sec=60)
 
 
 def view_water(query_params: dict) -> bytes:
@@ -1252,6 +1541,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._respond(200, view_report(path[len("/reports/"):]))
             elif path == "/decisions":
                 self._respond(200, view_decisions())
+            elif path == "/timeline":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._respond(200, view_timeline(query))
             elif path == "/calibrate":
                 self._respond(200, view_calibrate())
             elif path == "/overrides":
