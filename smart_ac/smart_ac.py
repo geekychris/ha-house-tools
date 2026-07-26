@@ -296,6 +296,11 @@ class Snapshot:
         self.party_mode = states.get("input_boolean.smart_ac_party_mode", {}).get("state") == "on"
         self.nap_mode = states.get("input_boolean.smart_ac_nap_mode", {}).get("state") == "on"
         self.vacation_mode = states.get("input_boolean.smart_ac_vacation_mode", {}).get("state") == "on"
+        # Maintain mode: "unoccupied but keep the house liveable" — solar-first
+        # daytime cooling plus SoC-gated evening/night baselines that shut off
+        # when the bank can't afford them. Combined with unoccupied; if the
+        # house is occupied this flag is ignored.
+        self.maintain_mode = states.get("input_boolean.smart_ac_maintain_mode", {}).get("state") == "on"
 
         # Charge boost: user says "for the next N hours, favor charging over
         # comfort." Backed by input_datetime.smart_ac_charge_boost_until;
@@ -561,6 +566,39 @@ def effective_params(snap: Snapshot, cfg: dict) -> dict:
             "max_total": cfg.get("vacation_max_acs_total", 1),
             "evening_extras": list(cfg.get("vacation_evening_extra_required", [])),
             "mode_label": "VACATION",
+        }
+    if snap.unoccupied and getattr(snap, "maintain_mode", False):
+        # MAINTAIN mode: unoccupied but keeping the house cool without
+        # torching the bank. Baselines are SoC-gated -- the evening room
+        # runs only if SoC > maintain_evening_min_soc, night room only if
+        # SoC > maintain_night_min_soc. Day cooling still layers on via
+        # SURPLUS/ON_TRACK from day_priority, capped by maintain_max_acs_total
+        # (usually one higher than plain unoccupied so hot afternoons get
+        # a third room). Comfort target sits between occupied and unoccupied.
+        priority = list(cfg.get("maintain_day_priority", cfg["day_priority"]))
+        if priority:
+            shift = snap.now.timetuple().tm_yday % len(priority)
+            priority = priority[shift:] + priority[:shift]
+        evening_min_soc = cfg.get("maintain_evening_min_soc", 60)
+        night_min_soc = cfg.get("maintain_night_min_soc", 85)
+        evening_room = cfg.get("maintain_evening_room", "living")
+        night_room = cfg.get("maintain_night_room", "living")
+        # SoC-gated baselines. Below threshold the baseline is empty and the
+        # bank rests. snap.soc == 0.0 (EG4 sensor unavailable) => empty too,
+        # which is the safe default.
+        night_min = [night_room] if snap.soc > night_min_soc else []
+        evening_min = [evening_room] if snap.soc > evening_min_soc else []
+        return {
+            "night_min": night_min,
+            "evening_min": evening_min,
+            "priority": priority,
+            "comfort_target_f": cfg.get("maintain_comfort_target_f", 80),
+            "outdoor_hot": cfg.get(
+                "maintain_unsensored_assume_hot_above_outdoor_f", 85,
+            ),
+            "max_total": cfg.get("maintain_max_acs_total", 3),
+            "evening_extras": list(cfg.get("maintain_evening_extra_required", [])),
+            "mode_label": "MAINTAIN",
         }
     if snap.unoccupied:
         priority = list(cfg["day_priority"])
@@ -1099,6 +1137,7 @@ def log_decision(
         "ac_on": dict(snap.ac_on),
         "enabled": snap.enabled,
         "unoccupied": snap.unoccupied,
+        "maintain_mode": getattr(snap, "maintain_mode", False),
         "target": {r: on for r, on in target.items()},
         "target_on": sorted([r for r, on in target.items() if on]),
         "actions": [f"{r}:{a}" for r, a in actions],
@@ -1363,6 +1402,7 @@ def publish_status(
         "indoor_f": {k: round(v, 1) for k, v in snap.indoor_f.items()},
         "enabled": snap.enabled,
         "unoccupied": snap.unoccupied,
+        "maintain_mode": getattr(snap, "maintain_mode", False),
         "notify_telegram": snap.notify_telegram,
         "occupied_bedrooms": sorted(getattr(snap, "occupied_bedrooms", set())),
         "occupancy_configured": sorted(getattr(snap, "occupancy_configured", set())),

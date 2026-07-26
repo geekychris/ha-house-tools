@@ -229,6 +229,7 @@ def view_dashboard() -> bytes:
       <div>Enabled</div><div>{a.get('enabled')}</div>
       <div>Notify TG</div><div>{a.get('notify_telegram')}</div>
       <div>Unoccupied</div><div>{a.get('unoccupied')}</div>
+      <div>Maintain</div><div>{'<span class="status-good">ON</span>' if a.get('maintain_mode') else 'off'}</div>
       <div>Last eval</div><div class="subtle">{last}</div>
     </div>
   </div>

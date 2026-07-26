@@ -19,10 +19,42 @@
   "unoccupied_evening_min_acs": [],
   "unoccupied_evening_extra_required": [],
 
+  "_occupancy_comment": "Optional per-bedroom occupancy overlay. Map each bedroom slug to its input_boolean.bedroom_<room>_occupied helper (created by setup_bedroom_occupancy_helpers.py). At runtime the scheduler intersects night_min_acs and evening_min_acs against occupied rooms, so a bedroom whose toggle is OFF drops out of the always-cooled sets even though it's listed above. Rooms not present in this mapping are treated as implicitly occupied; omit the whole key to disable the feature entirely.",
+  "occupancy_entity_for_room": {
+    "master": "input_boolean.bedroom_master_occupied",
+    "kids":   "input_boolean.bedroom_kids_occupied",
+    "guest":  "input_boolean.bedroom_guest_occupied"
+  },
+
+  "_occupancy_window_comment": "Optional per-bedroom TIME-OF-DAY windows layered on top of the occupancy toggles above. A bedroom is only considered occupied when its toggle is ON AND the current local time is inside its [from, to) window. Windows can wrap midnight (from > to means overnight, e.g. 22:00 -> 07:00). Rooms without a window entry are considered always in-window. Omit this whole key to disable the feature; the setup_bedroom_occupancy_helpers.py script creates the input_datetime helpers with sensible bedroom-hour defaults.",
+  "occupancy_window_entities_for_room": {
+    "master": {
+      "from": "input_datetime.bedroom_master_occupied_from",
+      "to":   "input_datetime.bedroom_master_occupied_until"
+    },
+    "kids": {
+      "from": "input_datetime.bedroom_kids_occupied_from",
+      "to":   "input_datetime.bedroom_kids_occupied_until"
+    },
+    "guest": {
+      "from": "input_datetime.bedroom_guest_occupied_from",
+      "to":   "input_datetime.bedroom_guest_occupied_until"
+    }
+  },
+
   "ac_power_estimate_w": 1000,
 
   "comfort_target_f": 78,
   "unsensored_assume_hot_above_outdoor_f": 80,
+
+  "_proxy_room_comment": "Optional. Rooms without their own indoor sensor use this room's sensor as a stand-in, compared against comfort_target_f (or the per-room override below). Falls back to unsensored_assume_hot_above_outdoor_f + outdoor_sensor if the proxy is unavailable or unset. Set null / omit to keep the pure-outdoor-threshold behaviour.",
+  "unsensored_proxy_room": null,
+
+  "_per_room_target_comment": "Optional. Per-room comfort target override -- JSON fallback. Any room listed here uses its own value instead of comfort_target_f. Slider entities below take precedence at runtime.",
+  "comfort_target_for_room": {},
+
+  "_per_room_target_entity_comment": "Optional. Live per-room comfort target sliders. Create via setup_comfort_target_helpers.py; the scheduler prefers these over comfort_target_for_room + comfort_target_f. Omit to disable slider-based control.",
+  "comfort_target_entity_for_room": {},
 
   "min_on_minutes": 15,
   "min_off_minutes": 10,
@@ -46,6 +78,17 @@
   "vacation_max_acs_total": 1,
   "vacation_comfort_target_f": 84,
   "vacation_unsensored_assume_hot_above_outdoor_f": 92,
+
+  "_maintain_comment": "Solar-first unoccupied mode. Triggered by input_boolean.smart_ac_maintain_mode ONLY while house_occupied=off (occupied wins if the house is occupied; vacation wins over maintain). Baselines are SoC-gated: evening room runs only if snap.soc > maintain_evening_min_soc, night room only if snap.soc > maintain_night_min_soc. DAY cooling still layers on via SURPLUS/ON_TRACK from maintain_day_priority, capped by maintain_max_acs_total. Use case: 'I'm away but I don't want the house to cook -- cool aggressively when solar allows, let the bank rest when it can't afford it.' See setup_smart_ac_maintain_helper.py to create the input_boolean.",
+  "maintain_day_priority": ["living", "master", "dining", "office"],
+  "maintain_max_acs_total": 3,
+  "maintain_comfort_target_f": 80,
+  "maintain_unsensored_assume_hot_above_outdoor_f": 85,
+  "maintain_evening_min_soc": 60,
+  "maintain_night_min_soc": 85,
+  "maintain_evening_room": "living",
+  "maintain_night_room": "living",
+  "maintain_evening_extra_required": [],
 
   "_party_comment": "Triggered by input_boolean.smart_ac_party_mode. Adds common-area ACs to the always-run set and lowers the comfort target.",
   "party_night_min_acs": ["master", "kids", "guest", "living", "dining"],

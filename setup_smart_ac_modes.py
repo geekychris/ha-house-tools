@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Create the three smart_ac mode toggle helpers as HA input_booleans:
+Create the smart_ac mode toggle helpers as HA input_booleans:
 
-  * input_boolean.smart_ac_party_mode   -- looser comfort target, add
+  * input_boolean.smart_ac_party_mode    -- looser comfort target, add
     living + dining to the "always run" set.
-  * input_boolean.smart_ac_nap_mode     -- 60-min turbo on master AC.
+  * input_boolean.smart_ac_nap_mode      -- 60-min turbo on master AC.
   * input_boolean.smart_ac_vacation_mode -- stricter unoccupied rules +
     SoC-guarded alerts. Slightly different from house_unoccupied (the
     older / more permissive equivalent), which stays available too.
+  * input_boolean.smart_ac_maintain_mode -- "solar-first unoccupied":
+    aggressive day cooling, SoC-gated evening/night baselines so the
+    bank rests when it can't afford to run. Active only when
+    house_occupied=off. See maintain_* keys in smart_ac.json.
 
 The scheduler branch that consumes these is implemented in smart_ac.py's
 effective_params(). Config keys picked up per mode live in smart_ac.json:
@@ -55,6 +59,11 @@ HELPERS = [
         "name": "Smart AC vacation mode",
         "icon": "mdi:airplane",
         "unique": "smart_ac_vacation_mode",
+    },
+    {
+        "name": "Smart AC maintain mode",
+        "icon": "mdi:home-thermometer",
+        "unique": "smart_ac_maintain_mode",
     },
 ]
 
