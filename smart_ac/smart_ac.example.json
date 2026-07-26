@@ -81,6 +81,8 @@
 
   "_maintain_comment": "Solar-first unoccupied mode. Triggered by input_boolean.smart_ac_maintain_mode ONLY while house_occupied=off (occupied wins if the house is occupied; vacation wins over maintain). Baselines are SoC-gated: evening room runs only if snap.soc > maintain_evening_min_soc, night room only if snap.soc > maintain_night_min_soc. DAY cooling still layers on via SURPLUS/ON_TRACK from maintain_day_priority, capped by maintain_max_acs_total. Use case: 'I'm away but I don't want the house to cook -- cool aggressively when solar allows, let the bank rest when it can't afford it.' See setup_smart_ac_maintain_helper.py to create the input_boolean.",
   "maintain_day_priority": ["living", "master", "dining", "office"],
+  "_maintain_priority_rotate_from_comment": "Priority split: the FIRST N entries of maintain_day_priority are strict (baseline cooling always picks the most-efficient rooms first). Entries beyond index N get day-of-year rotation so the 'extra capacity' slots alternate fairly. Default 2 = living+master stay first, dining/office rotate. Set to 0 to rotate everything (equal-fairness), or to len(priority) to disable rotation entirely.",
+  "maintain_priority_rotate_from": 2,
   "maintain_max_acs_total": 3,
   "maintain_comfort_target_f": 80,
   "maintain_unsensored_assume_hot_above_outdoor_f": 85,

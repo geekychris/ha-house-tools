@@ -576,12 +576,19 @@ def effective_params(snap: Snapshot, cfg: dict) -> dict:
         # (usually one higher than plain unoccupied so hot afternoons get
         # a third room). Comfort target sits between occupied and unoccupied.
         #
-        # No day-of-year priority rotation here (unlike unoccupied/vacation):
-        # the maintain priority list is efficiency-ordered on purpose --
-        # living cools the largest / most central room, master second, etc.
-        # Rotating it would put office (the least useful AC in the SF house)
-        # first every fourth day, wasting battery on marginal comfort.
+        # Priority: the FIRST maintain_priority_rotate_from entries stay
+        # strict (baseline picks the most-efficient rooms first -- at SF
+        # living cools the largest / most central space, master second).
+        # Entries at position rotate_from and beyond get day-of-year
+        # rotation so the "extra capacity" slots (dining, office) alternate
+        # fairly rather than always favouring the same one.
         priority = list(cfg.get("maintain_day_priority", cfg["day_priority"]))
+        rotate_from = cfg.get("maintain_priority_rotate_from", 2)
+        tail = priority[rotate_from:]
+        if len(tail) > 1:
+            shift = snap.now.timetuple().tm_yday % len(tail)
+            tail = tail[shift:] + tail[:shift]
+        priority = priority[:rotate_from] + tail
         evening_min_soc = cfg.get("maintain_evening_min_soc", 60)
         night_min_soc = cfg.get("maintain_night_min_soc", 85)
         evening_room = cfg.get("maintain_evening_room", "living")
