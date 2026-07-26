@@ -575,10 +575,13 @@ def effective_params(snap: Snapshot, cfg: dict) -> dict:
         # SURPLUS/ON_TRACK from day_priority, capped by maintain_max_acs_total
         # (usually one higher than plain unoccupied so hot afternoons get
         # a third room). Comfort target sits between occupied and unoccupied.
+        #
+        # No day-of-year priority rotation here (unlike unoccupied/vacation):
+        # the maintain priority list is efficiency-ordered on purpose --
+        # living cools the largest / most central room, master second, etc.
+        # Rotating it would put office (the least useful AC in the SF house)
+        # first every fourth day, wasting battery on marginal comfort.
         priority = list(cfg.get("maintain_day_priority", cfg["day_priority"]))
-        if priority:
-            shift = snap.now.timetuple().tm_yday % len(priority)
-            priority = priority[shift:] + priority[:shift]
         evening_min_soc = cfg.get("maintain_evening_min_soc", 60)
         night_min_soc = cfg.get("maintain_night_min_soc", 85)
         evening_room = cfg.get("maintain_evening_room", "living")
