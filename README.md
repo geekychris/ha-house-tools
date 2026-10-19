@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Ha House Tools logo" width="180">
+</p>
+
 # ha-house-tools
 
 Idempotent Python scripts that configure a Home Assistant instance
